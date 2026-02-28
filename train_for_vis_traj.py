@@ -11,7 +11,7 @@ import importlib
 
 torch.autograd.set_detect_anomaly(True)
 
-from utils.blocktower_data_nff import BlockTowerData, GroupedBatchSampler, process_stacking_data_dynamic
+from utils.blocktower_data_nff import BlockTowerData, TrialData, GroupedBatchSampler, process_stacking_data_dynamic
 
 def get_args():
     parser = argparse.ArgumentParser()
@@ -164,6 +164,109 @@ def validate_epoch(model, val_loader, criterion, device, args, save_predictions=
     else:
         return val_loss, val_loss_pos, val_loss_quat
 
+def run_trial_set(model, data_loader, criterion, device, save_predictions=True):
+    """
+    在实验的所有trial集上运行一个epoch
+    
+    Args:
+        save_predictions: 是否保存预测结果用于可视化
+    
+    Returns:
+        val_loss, val_loss_pos, val_loss_quat, predictions (如果save_predictions=True)
+    """
+    model.eval()
+    val_loss = 0
+    val_loss_pos = 0
+    val_loss_quat = 0
+    
+    # 如果需要保存可视化数据,分别收集stable和unstable场景
+    stable_scenes = [] if save_predictions else None
+    unstable_scenes = [] if save_predictions else None
+    
+    with torch.no_grad():
+        for batch_idx, (game_names, body_prop, vel, ang_vel, body_nums) in enumerate(data_loader):
+            body_prop = body_prop.to(device)
+            vel = vel.to(device)
+            ang_vel = ang_vel.to(device)
+            
+            true_traj = body_prop[..., 0:7].clone() # pos + quat
+            
+            # 第0帧作为初始状态
+            z0 = torch.cat([
+                body_prop[:, 0, :, :], 
+                vel[:, 0, :, :],       
+                ang_vel[:, 0, :, :]    
+            ], dim=-1)
+            
+            sim_steps = true_traj.shape[1] # 150
+            t = torch.linspace(0, (sim_steps-1)/25.0, steps=sim_steps, device=device).unsqueeze(0)
+            
+            pred_traj = model(z0, t)  # [batch, time, obj, 17]
+            pred_pos = pred_traj[..., 0:3]
+            pred_quat = pred_traj[..., 3:7]
+            
+            true_pos = true_traj[..., 0:3]
+            true_quat = true_traj[..., 3:7]
+
+            loss_pos = criterion(pred_pos, true_pos)
+            loss_quat = criterion(pred_quat, true_quat)
+            loss = loss_pos + loss_quat * 10.0
+            
+            val_loss += loss.item()
+            val_loss_pos += loss_pos.item()
+            val_loss_quat += loss_quat.item()
+            
+            # 保存可视化数据 - 分别收集stable和unstable场景
+            if save_predictions:
+                # 这里的game_names是一个batch的场景名称列表
+                batch_size = len(game_names)
+                pred_traj_np = pred_traj.cpu().numpy()  # [batch, time, obj, 17]
+                
+                # 构建完整的true_traj (包含速度和角速度)
+                # true_traj 只有 [batch, time, obj, 7], 需要补充速度
+                true_traj_full = torch.cat([
+                    true_traj,      # [batch, time, obj, 7] pos + quat
+                    body_prop[..., 7:11],  # [batch, time, obj, 4] size + dynamic_mask
+                    vel,            # [batch, time, obj, 3] velocity
+                    ang_vel         # [batch, time, obj, 3] angular velocity
+                ], dim=-1).cpu().numpy()  # [batch, time, obj, 17]
+                
+                for i in range(batch_size):
+                    scene_name = game_names[i]
+                    
+                    # 判断场景类型
+                    is_stable = 'stable' in scene_name and 'unstable' not in scene_name
+                    is_unstable = 'unstable' in scene_name
+                    
+                    scene_data = {
+                        'name': scene_name,
+                        'pred': pred_traj_np[i],      # [time, obj, 17]
+                        'true': true_traj_full[i],    # [time, obj, 17]
+                        'num_objs': body_nums[i] if isinstance(body_nums, (list, np.ndarray)) else body_nums
+                    }
+                    
+                    # 分类保存
+                    if is_stable:
+                        stable_scenes.append(scene_data)
+                    elif is_unstable:
+                        unstable_scenes.append(scene_data)
+    
+    # 计算平均损失
+    num_batches = len(data_loader)
+    val_loss /= num_batches
+    val_loss_pos /= num_batches
+    val_loss_quat /= num_batches
+    
+    if save_predictions:
+        # 合并场景数据
+        predictions = {
+            'stable_scenes': stable_scenes,
+            'unstable_scenes': unstable_scenes
+        }
+        return predictions
+    else:
+        return None
+
 def main():
     args = get_args()
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -213,6 +316,7 @@ def main():
     # 2. 数据加载和划分
     print(f"Loading Dataset ({args.scene_type})...")
     dataset = BlockTowerData(data_path=args.data_path, max_len=150, scene_type=args.scene_type)
+    trial_set = TrialData(data_path=args.data_path, max_len=150, scene_type=args.scene_type)
     
     # 划分训练集和验证集
     train_dataset, val_dataset, val_stable_indices, val_unstable_indices = dataset.split_train_val(
@@ -227,6 +331,10 @@ def main():
     # 创建验证集DataLoader
     val_batch_sampler = GroupedBatchSampler(val_dataset, batch_size=args.batch_size, shuffle=False)
     val_loader = DataLoader(val_dataset, batch_sampler=val_batch_sampler, num_workers=0)
+
+    # 创建实验试次集DataLoader
+    trial_batch_sampler = GroupedBatchSampler(trial_set, batch_size=args.batch_size, shuffle=False)
+    trial_loader = DataLoader(trial_set, batch_sampler=trial_batch_sampler, num_workers=0)
     
     optimizer = optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
@@ -389,6 +497,11 @@ def main():
     print(f"\nTraining completed! Best validation loss: {best_val_loss:.6f}")
     print(f"Training history saved to: {history_path}")
     logging.info(f"Training completed. Best validation loss: {best_val_loss:.6f}")
+
+    state_dict = torch.load(os.path.join(args.save_dir, 'model_best.pt'), map_location=device)
+    model.load_state_dict(state_dict)
+    trial_predictions = run_trial_set(model, trial_loader, criterion, device, args, save_predictions=True)
+    np.save(f"{args.save_dir}/trial_predictions.npy", trial_predictions)
 
 if __name__ == "__main__":
     main()
