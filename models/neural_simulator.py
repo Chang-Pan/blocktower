@@ -210,7 +210,7 @@ class ForceFieldPredictor(nn.Module):
 
         return distance_to_box
     
-    def forward(self, init_x,query_x,init_v,query_v,init_angular_v,query_angular_v):
+    def forward(self, init_x,query_x,init_v,query_v,init_angular_v,query_angular_v, pos_norm):
         """
         init_x: [batch, obj_num, 11] - objects applying force (x,y,z,qx,qy,qz,qw,lx,ly,lz,dynamic_mask)
         query_x: [batch, target_obj_num, 11] - objects receiving force (x,y,z,qx,qy,qz,qw,lx,ly,lz,dynamic_mask)
@@ -258,7 +258,7 @@ class ForceFieldPredictor(nn.Module):
         # calculate distance mask
         if self.use_dist_mask:
             distance_to_capsule = self.compute_dist_mask(init_x_exp.clone(), query_x_exp.clone())
-            dist_mask = (distance_to_capsule <= self.dist_boundary).float()
+            dist_mask = (distance_to_capsule <= self.dist_boundary / pos_norm.view(-1, 1, 1, 1)).float()    # 对dist_boundary进行放缩，每个场景一个统一的尺度，与pos相同
             dist_input = distance_to_capsule * dist_mask
             dist_input *= self.dist_input_scale
         # predict force
@@ -386,6 +386,16 @@ class ODEFunc(nn.Module):
         all_features = all_features.clone()  # 避免就地修改
         all_features[:, :, 3:7] = curr_quat_normalized
         
+        # 1.5. 归一化位置（为了碰撞检测和模型预测，积木形状和线速度也在输入ForcePredictor之前scale一下)
+        curr_pos = all_features[:, :, :3]
+        curr_size = all_features[:, :, 7:10]
+        pos_norm = torch.norm(curr_pos, dim=-1).amax(dim=1, keepdim=True)  # scene_scale: [batch_size, 1]  每个场景一个统一的尺度
+        pos_norm = torch.clamp(pos_norm, min=1e-8)
+        curr_pos_normalized = curr_pos / pos_norm.unsqueeze(-1)
+        all_features = all_features.clone()
+        all_features[:, :, :3] = curr_pos_normalized
+        all_features[:, :, 7:10] = curr_size / pos_norm.unsqueeze(-1)   # 积木尺寸也跟着缩放
+        
         # 2. 钳制速度和角速度 (防止数值爆炸)
         velocities = torch.clamp(velocities, min=-100.0, max=100.0)
         angular_v = torch.clamp(angular_v, min=-100.0, max=100.0)
@@ -394,15 +404,18 @@ class ODEFunc(nn.Module):
         if t.item() == 0 and torch.rand(1).item() < 0.01:  # 1%概率打印
             print(f"[Debug] Quat norm before: {torch.norm(curr_quat, dim=-1).mean():.6f}")
             print(f"[Debug] Quat norm after: {torch.norm(curr_quat_normalized, dim=-1).mean():.6f}")
+            print(f"[Debug] Pos norm before: {torch.norm(curr_pos, dim=-1).mean():.6f}")
+            print(f"[Debug] Pos norm after: {torch.norm(curr_pos_normalized, dim=-1).mean():.6f}")
             print(f"[Debug] Velocity range: [{velocities.min():.2f}, {velocities.max():.2f}]")
 
         pairwise_force, ground_force = self.force_predictor(
             init_x=all_features,
             query_x=all_features,
-            init_v=velocities,
-            query_v=velocities,
+            init_v=velocities/pos_norm.unsqueeze(-1),
+            query_v=velocities/pos_norm.unsqueeze(-1),
             init_angular_v=angular_v,
-            query_angular_v=angular_v
+            query_angular_v=angular_v,
+            pos_norm=pos_norm
         ) # [batch_size, obj_num, obj_num, 6] [i,j] means the force of object j received from object i
         # ground_force: [batch, obj_num, 6]
 
