@@ -174,7 +174,7 @@ class TrialData(Dataset):
         self.max_len = max_len
         self.scene_type = scene_type
         
-        print(f"[BlockTowerData] Initialized with scene_type='{scene_type}'")
+        print(f"[TrialData] Initialized with scene_type='{scene_type}'")
 
         all_file_paths = glob.glob(os.path.join(data_path, "*.npy"))
         if len(all_file_paths) == 0:

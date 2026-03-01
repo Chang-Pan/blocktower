@@ -15,9 +15,9 @@ from utils.blocktower_data_nff import BlockTowerData, TrialData, GroupedBatchSam
 
 def get_args():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--data_path', type=str, default='/mnt/nfs_project_a/chang/data/data/blocktower', help='Path to the dataset folder containing .npy files')
-    parser.add_argument('--save_dir', type=str, default='exps/my_exp')
-    parser.add_argument('--model_name', type=str, default='neural_simulator')
+    parser.add_argument('--data_path', type=str, default='/mnt/nfs_project_a/chang/small_data/data/blocktower', help='Path to the dataset folder containing .npy files')
+    parser.add_argument('--save_dir', type=str, default='exps/posnormed')
+    parser.add_argument('--model_name', type=str, default='posnormed_neural_simulator')
     parser.add_argument('--seed', type=int, default=42)
     parser.add_argument('--epochs', type=int, default=100)
     parser.add_argument('--batch_size', type=int, default=16) 
@@ -27,7 +27,7 @@ def get_args():
     parser.add_argument('--layer_num', type=int, default=3)
     parser.add_argument('--segment_len', type=int, default=15, help='Number of simulation steps per segment, suggested 3-30 for training')
     parser.add_argument('--step_size', type=float, default=1/200, help='step size of ode solver')
-    parser.add_argument('--dist_boundary', type=float, default=0.03, help='Boundary of distance mask')
+    parser.add_argument('--dist_boundary', type=float, default=0.02, help='Boundary of distance mask')
     parser.add_argument('--use_dist_mask', action='store_true', default=True)
     parser.add_argument('--use_dist_input', action='store_true', default=True)
     parser.add_argument('--use_adjoint', action='store_true', default=True, help='Use adjoint method for memory efficiency')

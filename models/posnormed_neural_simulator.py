@@ -467,7 +467,7 @@ class ODEFunc(nn.Module):
         
         if self.scene_scale is not None:
             # 根据场景缩放重调地面重力
-            scaled_gravity = self.gravity / self.scene_scale.view(-1, 1, 1) # 场景越大，重力越小（因为距离单位变大了）
+            scaled_gravity = self.gravity / self.scene_scale.view(-1, 1) # 场景越大，重力越小（因为距离单位变大了）
             acceleration[:,:,2] += scaled_gravity
         else:
             # y是高度则是1，z是高度则是2
