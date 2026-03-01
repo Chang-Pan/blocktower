@@ -93,7 +93,7 @@ def validate_epoch(model, val_loader, criterion, device, args, save_predictions=
 
             loss_pos = criterion(pred_pos, true_pos)
             loss_quat = criterion(pred_quat, true_quat)
-            loss = loss_pos + loss_quat * 100.0
+            loss = loss_pos + loss_quat
             
             val_loss += loss.item()
             val_loss_pos += loss_pos.item()
@@ -304,7 +304,7 @@ def main():
 
             loss_pos = criterion(pred_pos, true_pos)
             loss_quat = criterion(pred_quat, true_quat)
-            loss = loss_pos + loss_quat * 100.0    # 根据debug的观察，二者还是存在数量级的差距，不知道在val set上表现怎么样，可能得调整一下
+            loss = loss_pos + loss_quat    # 根据debug的观察，二者还是存在数量级的差距，不知道在val set上表现怎么样，可能得调整一下
             
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
