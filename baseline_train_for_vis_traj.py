@@ -186,7 +186,7 @@ def main():
     try:
         model_module = importlib.import_module(args.model_name)
     except ImportError:
-        import models.neural_simulator as model_module
+        import models.posnormed_neural_simulator as model_module
         
     ForceFieldPredictor = model_module.ForceFieldPredictor
     ODEFunc = model_module.ODEFunc

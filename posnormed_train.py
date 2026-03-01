@@ -66,12 +66,33 @@ def validate_epoch(model, val_loader, criterion, device, args, save_predictions=
     stable_scenes = [] if save_predictions else None
     unstable_scenes = [] if save_predictions else None
     
+    collected_enough = False
+
     with torch.no_grad():
         for batch_idx, (game_names, body_prop, vel, ang_vel, body_nums) in enumerate(val_loader):
             body_prop = body_prop.to(device)
             vel = vel.to(device)
             ang_vel = ang_vel.to(device)
             
+            # 全局归一化
+            # 计算scale：找每个batch里最大的坐标值，只考虑第0帧
+            pos_initial = body_prop[:, 0, :, 0:3] # [Batch, Obj, 3]
+            pos_flat = pos_initial.reshape(body_prop.size(0), -1) # [Batch, Time*Obj*3]
+            scene_scale = torch.max(torch.abs(pos_flat), dim=1)[0] # [Batch]
+            scene_scale = torch.clamp(scene_scale, min=1.0) # 防止过小
+            scale_view = scene_scale.view(-1, 1, 1, 1) # [batch, 1, 1, 1]
+
+            # 备份原始数据用于 True Trajectory (在保存可视化时用到)
+            # 注意: body_prop 会被就地修改，这里深拷贝一份需要保存的部分
+            # 实际上我们需要保存完整的原始 true trajectory 用于对比
+            true_traj_orig_full = torch.cat([body_prop, vel, ang_vel], dim=-1).clone() # [Batch, Time, Obj, 17]
+
+            # 执行归一化
+            body_prop[..., 0:3] /= scale_view   # Position
+            body_prop[..., 7:10] /= scale_view  # Size
+            vel /= scale_view                   # Velocity
+
+            # True Traj 用于算 Loss，也需要是归一化的
             true_traj = body_prop[..., 0:7].clone() # pos + quat
             
             # 第0帧作为初始状态
@@ -84,7 +105,8 @@ def validate_epoch(model, val_loader, criterion, device, args, save_predictions=
             sim_steps = true_traj.shape[1] # 150
             t = torch.linspace(0, (sim_steps-1)/25.0, steps=sim_steps, device=device).unsqueeze(0)
             
-            pred_traj = model(z0, t)  # [batch, time, obj, 17]
+            # pred_traj的输出是归一化的，所以在计算loss时直接用pred_traj和true_traj（都是归一化的）进行比较是合理的
+            pred_traj = model(z0, t, scene_scale=scene_scale)  # [batch, time, obj, 17]
             pred_pos = pred_traj[..., 0:3]
             pred_quat = pred_traj[..., 3:7]
             
@@ -100,19 +122,17 @@ def validate_epoch(model, val_loader, criterion, device, args, save_predictions=
             val_loss_quat += loss_quat.item()
             
             # 保存可视化数据 - 分别收集stable和unstable场景
-            if save_predictions:
+            if save_predictions and not collected_enough:
                 # 这里的game_names是一个batch的场景名称列表
                 batch_size = len(game_names)
                 pred_traj_np = pred_traj.cpu().numpy()  # [batch, time, obj, 17]
-                
-                # 构建完整的true_traj (包含速度和角速度)
-                # true_traj 只有 [batch, time, obj, 7], 需要补充速度
-                true_traj_full = torch.cat([
-                    true_traj,      # [batch, time, obj, 7] pos + quat
-                    body_prop[..., 7:11],  # [batch, time, obj, 4] size + dynamic_mask
-                    vel,            # [batch, time, obj, 3] velocity
-                    ang_vel         # [batch, time, obj, 3] angular velocity
-                ], dim=-1).cpu().numpy()  # [batch, time, obj, 17]
+                scale_np = scene_scale.cpu().numpy()  # [batch]
+                true_traj_np = true_traj_orig_full.cpu().numpy() # 原始未归一化的真值 [Batch, Time, Obj, 17]
+
+                # 反归一化用于可视化
+                pred_traj_np[..., 0:3] *= scale_np[:, None, None, None]   # Position
+                pred_traj_np[..., 7:10] *= scale_np[:, None, None, None] # Size
+                pred_traj_np[..., 11:14] *= scale_np[:, None, None, None]  # Velocity
                 
                 for i in range(batch_size):
                     scene_name = game_names[i]
@@ -124,7 +144,7 @@ def validate_epoch(model, val_loader, criterion, device, args, save_predictions=
                     scene_data = {
                         'name': scene_name,
                         'pred': pred_traj_np[i],      # [time, obj, 17]
-                        'true': true_traj_full[i],    # [time, obj, 17]
+                        'true': true_traj_np[i],    # [time, obj, 17]
                         'num_objs': body_nums[i] if isinstance(body_nums, (list, np.ndarray)) else body_nums
                     }
                     
@@ -134,18 +154,14 @@ def validate_epoch(model, val_loader, criterion, device, args, save_predictions=
                     elif is_unstable and len(unstable_scenes) < args.vis_unstable_scenes:
                         unstable_scenes.append(scene_data)
                     
-                    # 如果已经收集够了,可以提前结束
+                    # 如果已经收集够了,标记但不能break
                     if (len(stable_scenes) >= args.vis_stable_scenes and 
                         len(unstable_scenes) >= args.vis_unstable_scenes):
-                        break
-            
-            # 提前结束循环
-            if save_predictions and (len(stable_scenes) >= args.vis_stable_scenes and 
-                                     len(unstable_scenes) >= args.vis_unstable_scenes):
-                print(f"  Collected enough scenes for visualization: "
-                      f"{len(stable_scenes)} stable, {len(unstable_scenes)} unstable")
-                break
-    
+                        if not collected_enough:
+                            print(f"  Collected enough scenes for visualization: "
+                                f"{len(stable_scenes)} stable, {len(unstable_scenes)} unstable")
+                        collected_enough = True
+
     # 计算平均损失
     num_batches = len(val_loader)
     val_loss /= num_batches
@@ -164,24 +180,13 @@ def validate_epoch(model, val_loader, criterion, device, args, save_predictions=
     else:
         return val_loss, val_loss_pos, val_loss_quat
 
-def run_trial_set(model, data_loader, criterion, device, save_predictions=True):
+def run_trial_set(model, data_loader, criterion, device, args):
     """
-    在实验的所有trial集上运行一个epoch
-    
-    Args:
-        save_predictions: 是否保存预测结果用于可视化
-    
-    Returns:
-        val_loss, val_loss_pos, val_loss_quat, predictions (如果save_predictions=True)
+    运行Trial Set，仅保存预测结果用于后续分析，不保存可视化动图数据
+    return: List of dicts (name, pred, true)
     """
     model.eval()
-    val_loss = 0
-    val_loss_pos = 0
-    val_loss_quat = 0
-    
-    # 如果需要保存可视化数据,分别收集stable和unstable场景
-    stable_scenes = [] if save_predictions else None
-    unstable_scenes = [] if save_predictions else None
+    all_predictions = []
     
     with torch.no_grad():
         for batch_idx, (game_names, body_prop, vel, ang_vel, body_nums) in enumerate(data_loader):
@@ -189,8 +194,20 @@ def run_trial_set(model, data_loader, criterion, device, save_predictions=True):
             vel = vel.to(device)
             ang_vel = ang_vel.to(device)
             
-            true_traj = body_prop[..., 0:7].clone() # pos + quat
-            
+            # [新增] 归一化
+            pos_initial = body_prop[:, 0, :, 0:3] # [Batch, Obj, 3]
+            pos_flat = pos_initial.reshape(body_prop.size(0), -1)
+            scene_scale = torch.max(torch.abs(pos_flat), dim=1)[0]
+            scene_scale = torch.clamp(scene_scale, min=1.0)
+            scale_view = scene_scale.view(-1, 1, 1, 1)
+
+            # 备份原始真值
+            true_traj_orig_full = torch.cat([body_prop, vel, ang_vel], dim=-1).clone()
+
+            body_prop[..., 0:3] /= scale_view
+            body_prop[..., 7:10] /= scale_view
+            vel /= scale_view
+
             # 第0帧作为初始状态
             z0 = torch.cat([
                 body_prop[:, 0, :, :], 
@@ -198,74 +215,33 @@ def run_trial_set(model, data_loader, criterion, device, save_predictions=True):
                 ang_vel[:, 0, :, :]    
             ], dim=-1)
             
-            sim_steps = true_traj.shape[1] # 150
+            sim_steps = body_prop.shape[1] # 150
             t = torch.linspace(0, (sim_steps-1)/25.0, steps=sim_steps, device=device).unsqueeze(0)
             
-            pred_traj = model(z0, t)  # [batch, time, obj, 17]
-            pred_pos = pred_traj[..., 0:3]
-            pred_quat = pred_traj[..., 3:7]
-            
-            true_pos = true_traj[..., 0:3]
-            true_quat = true_traj[..., 3:7]
+            pred_traj = model(z0, t, scene_scale=scene_scale)  # [batch, time, obj, 17]
 
-            loss_pos = criterion(pred_pos, true_pos)
-            loss_quat = criterion(pred_quat, true_quat)
-            loss = loss_pos + loss_quat * 10.0
+            # 反归一化并保存
+            pred_traj_np = pred_traj.cpu().numpy()  # [batch, time, obj, 17]
+            scale_np = scene_scale.cpu().numpy()  # [batch]
+            true_traj_np = true_traj_orig_full.cpu().numpy() # [Batch, Time, Obj, 17]
             
-            val_loss += loss.item()
-            val_loss_pos += loss_pos.item()
-            val_loss_quat += loss_quat.item()
+            scale_np_view = scale_np[:, None, None, None]
+            pred_traj_np[..., 0:3] *= scale_np_view   # Position
+            pred_traj_np[..., 7:10] *= scale_np_view # Size
+            pred_traj_np[..., 11:14] *= scale_np_view  # Velocity
             
-            # 保存可视化数据 - 分别收集stable和unstable场景
-            if save_predictions:
-                # 这里的game_names是一个batch的场景名称列表
-                batch_size = len(game_names)
-                pred_traj_np = pred_traj.cpu().numpy()  # [batch, time, obj, 17]
-                
-                # 构建完整的true_traj (包含速度和角速度)
-                # true_traj 只有 [batch, time, obj, 7], 需要补充速度
-                true_traj_full = torch.cat([
-                    true_traj,      # [batch, time, obj, 7] pos + quat
-                    body_prop[..., 7:11],  # [batch, time, obj, 4] size + dynamic_mask
-                    vel,            # [batch, time, obj, 3] velocity
-                    ang_vel         # [batch, time, obj, 3] angular velocity
-                ], dim=-1).cpu().numpy()  # [batch, time, obj, 17]
-                
-                for i in range(batch_size):
-                    scene_name = game_names[i]
-                    
-                    # 判断场景类型
-                    is_stable = 'stable' in scene_name and 'unstable' not in scene_name
-                    is_unstable = 'unstable' in scene_name
-                    
-                    scene_data = {
-                        'name': scene_name,
-                        'pred': pred_traj_np[i],      # [time, obj, 17]
-                        'true': true_traj_full[i],    # [time, obj, 17]
-                        'num_objs': body_nums[i] if isinstance(body_nums, (list, np.ndarray)) else body_nums
-                    }
-                    
-                    # 分类保存
-                    if is_stable:
-                        stable_scenes.append(scene_data)
-                    elif is_unstable:
-                        unstable_scenes.append(scene_data)
+            batch_size = len(game_names)
+            for i in range(batch_size):
+                scene_name = game_names[i]
+                scene_data = {
+                    'name': scene_name,
+                    'pred': pred_traj_np[i],      # [time, obj, 17]
+                    'true': true_traj_np[i],    # [time, obj, 17]
+                    'num_objs': body_nums[i] if isinstance(body_nums, (list, np.ndarray)) else body_nums
+                }
+                all_predictions.append(scene_data)
     
-    # 计算平均损失
-    num_batches = len(data_loader)
-    val_loss /= num_batches
-    val_loss_pos /= num_batches
-    val_loss_quat /= num_batches
-    
-    if save_predictions:
-        # 合并场景数据
-        predictions = {
-            'stable_scenes': stable_scenes,
-            'unstable_scenes': unstable_scenes
-        }
-        return predictions
-    else:
-        return None
+    return all_predictions
 
 def main():
     args = get_args()
@@ -290,7 +266,7 @@ def main():
     try:
         model_module = importlib.import_module(args.model_name)
     except ImportError:
-        import models.neural_simulator as model_module
+        import models.posnormed_neural_simulator as model_module
         
     ForceFieldPredictor = model_module.ForceFieldPredictor
     ODEFunc = model_module.ODEFunc
@@ -354,17 +330,6 @@ def main():
     curriculum_schedule = [
         (100, args.segment_len),   # 0-99, len=segment_len
     ]
-    #curriculum_schedule = [
-        #(50, 5),   # 0-49, len=5
-        #(100, 10), # 50-99, len=10
-        #(150, 15), # 100-149, len=15
-        #(200, 20), # 150-199, len=20
-        #(250, 5), # 200-249, len=5
-        #(300, 10), # 250-299, len=10
-        #(350, 15), # 300-349, len=15
-        #(400, 20), # 350-399, len=20
-        #(450, 30), # 400-449, len=30
-    #]
 
     for epoch in range(args.epochs):
         epoch_loss = 0
@@ -384,11 +349,29 @@ def main():
             vel = vel.to(device)
             ang_vel = ang_vel.to(device)
             
+            # [新增] 归一化输入数据
+            # 计算当前 batch 的 global scale
+            # 注意: 这里 body_prop 是 [Batch, Time, Obj, Feat]
+            pos_initial = body_prop[:, 0, :, 0:3] # [Batch, Obj, 3]
+            pos_flat = pos_initial.reshape(body_prop.size(0), -1)
+            scene_scale = torch.max(torch.abs(pos_flat), dim=1)[0]
+            scene_scale = torch.clamp(scene_scale, min=1.0)
+            scale_view = scene_scale.view(-1, 1, 1, 1)
+
+            body_prop[..., 0:3] /= scale_view
+            body_prop[..., 7:10] /= scale_view
+            vel /= scale_view
+
             true_traj = body_prop[..., 0:7].clone()
             
             body_prop_s, vel_s, ang_vel_s, true_traj_s = process_stacking_data_dynamic(
                 body_prop, true_traj, vel, ang_vel, SEGMENTS=current_segment_len
             )
+
+            # process_stacking_data_dynamic 会展平 batch 和 segments -> [Batch*Seg, Time, Obj, ...]
+            # 我们的 scene_scale 是 [Batch], 需要扩展对应
+            num_segments_per_sample = body_prop_s.shape[0] // body_prop.shape[0] # 每条数据切成了几段
+            scene_scale_expanded = scene_scale.repeat_interleave(num_segments_per_sample) # [Batch*Seg]
             
             z0 = torch.cat([
                 body_prop_s[:, 0, :, :], 
@@ -401,9 +384,7 @@ def main():
             
             optimizer.zero_grad()
             
-            pred_traj = model(z0, t)
-            #quat_norms = torch.norm(pred_traj[..., 3:7], dim=-1)
-            #print(f"Output quat norms: min={quat_norms.min():.6f}, max={quat_norms.max():.6f}")
+            pred_traj = model(z0, t, scene_scale=scene_scale_expanded)
             pred_pos = pred_traj[..., 0:3]
             pred_quat = pred_traj[..., 3:7]
             
@@ -412,7 +393,7 @@ def main():
 
             loss_pos = criterion(pred_pos, true_pos)
             loss_quat = criterion(pred_quat, true_quat)
-            loss = loss_pos + loss_quat    # 根据debug的观察，二者还是存在数量级的差距，不知道在val set上表现怎么样，可能得调整一下
+            loss = loss_pos + loss_quat    
             
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
@@ -500,8 +481,9 @@ def main():
 
     state_dict = torch.load(os.path.join(args.save_dir, 'model_best.pt'), map_location=device)
     model.load_state_dict(state_dict)
-    trial_predictions = run_trial_set(model, trial_loader, criterion, device, args, save_predictions=True)
+    trial_predictions = run_trial_set(model, trial_loader, criterion, device, args)
     np.save(f"{args.save_dir}/trial_predictions.npy", trial_predictions)
+    print(f"Trial predictions saved to {args.save_dir}/trial_predictions.npy")
 
 if __name__ == "__main__":
     main()
