@@ -11,11 +11,11 @@ import importlib
 
 torch.autograd.set_detect_anomaly(True)
 
-from utils.blocktower_data_nff import BlockTowerData, TrialData, GroupedBatchSampler, process_stacking_data_dynamic
+from utils.blocktower_data_nff import TrialData, GroupedBatchSampler, process_stacking_data_dynamic
 
 def get_args():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--data_path', type=str, default='/mnt/nfs_project_a/chang/data/data/blocktower', help='Path to the dataset folder containing .npy files')
+    parser.add_argument('--trial_data_path', type=str, default='/mnt/nfs_project_a/chang/data/data/blocktower', help='Path to the dataset folder containing .npy files')
     parser.add_argument('--save_dir', type=str, default='exps/my_exp')
     parser.add_argument('--model_name', type=str, default='neural_simulator')
     parser.add_argument('--seed', type=int, default=42)
@@ -111,7 +111,7 @@ def run_trial_set(model, data_loader, criterion, device, args):
     return all_predictions
 
 
-# ！！！注意args.data_path是存放原来的3000个场景的Path，因为实验用到的1800个trial包含在里面，不要设置成train的时候用的小场景path
+# ！！！注意args.trial_data_path是存放原来的3000个场景的Path，因为实验用到的1800个trial包含在里面，不要设置成train的时候用的小场景path
 def main():
     args = get_args()
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -160,7 +160,7 @@ def main():
     
     # 2. 数据加载和划分
     print(f"Loading Dataset ({args.scene_type})...")
-    trial_set = TrialData(data_path=args.data_path, max_len=150, scene_type=args.scene_type)
+    trial_set = TrialData(data_path=args.trial_data_path, max_len=150, scene_type=args.scene_type)
 
     # 创建实验试次集DataLoader
     trial_batch_sampler = GroupedBatchSampler(trial_set, batch_size=args.batch_size, shuffle=False)

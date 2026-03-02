@@ -11,7 +11,7 @@ import importlib
 
 torch.autograd.set_detect_anomaly(True)
 
-from utils.blocktower_data_nff import BlockTowerData, TrialData, GroupedBatchSampler, process_stacking_data_dynamic
+from utils.blocktower_data_nff import BlockTowerData, GroupedBatchSampler, process_stacking_data_dynamic
 
 def get_args():
     parser = argparse.ArgumentParser()
@@ -180,69 +180,6 @@ def validate_epoch(model, val_loader, criterion, device, args, save_predictions=
     else:
         return val_loss, val_loss_pos, val_loss_quat
 
-def run_trial_set(model, data_loader, criterion, device, args):
-    """
-    运行Trial Set，仅保存预测结果用于后续分析，不保存可视化动图数据
-    return: List of dicts (name, pred, true)
-    """
-    model.eval()
-    all_predictions = []
-    
-    with torch.no_grad():
-        for batch_idx, (game_names, body_prop, vel, ang_vel, body_nums) in enumerate(data_loader):
-            body_prop = body_prop.to(device)
-            vel = vel.to(device)
-            ang_vel = ang_vel.to(device)
-            
-            # [新增] 归一化
-            pos_initial = body_prop[:, 0, :, 0:3] # [Batch, Obj, 3]
-            pos_flat = pos_initial.reshape(body_prop.size(0), -1)
-            scene_scale = torch.max(torch.abs(pos_flat), dim=1)[0]
-            scene_scale = torch.clamp(scene_scale, min=1.0)
-            scale_view = scene_scale.view(-1, 1, 1, 1)
-
-            # 备份原始真值
-            true_traj_orig_full = torch.cat([body_prop, vel, ang_vel], dim=-1).clone()
-
-            body_prop[..., 0:3] /= scale_view
-            body_prop[..., 7:10] /= scale_view
-            vel /= scale_view
-
-            # 第0帧作为初始状态
-            z0 = torch.cat([
-                body_prop[:, 0, :, :], 
-                vel[:, 0, :, :],       
-                ang_vel[:, 0, :, :]    
-            ], dim=-1)
-            
-            sim_steps = body_prop.shape[1] # 150
-            t = torch.linspace(0, (sim_steps-1)/25.0, steps=sim_steps, device=device).unsqueeze(0)
-            
-            pred_traj = model(z0, t, scene_scale=scene_scale)  # [batch, time, obj, 17]
-
-            # 反归一化并保存
-            pred_traj_np = pred_traj.cpu().numpy()  # [batch, time, obj, 17]
-            scale_np = scene_scale.cpu().numpy()  # [batch]
-            true_traj_np = true_traj_orig_full.cpu().numpy() # [Batch, Time, Obj, 17]
-            
-            scale_np_view = scale_np[:, None, None, None]
-            pred_traj_np[..., 0:3] *= scale_np_view   # Position
-            pred_traj_np[..., 7:10] *= scale_np_view # Size
-            pred_traj_np[..., 11:14] *= scale_np_view  # Velocity
-            
-            batch_size = len(game_names)
-            for i in range(batch_size):
-                scene_name = game_names[i]
-                scene_data = {
-                    'name': scene_name,
-                    'pred': pred_traj_np[i],      # [time, obj, 17]
-                    'true': true_traj_np[i],    # [time, obj, 17]
-                    'num_objs': body_nums[i] if isinstance(body_nums, (list, np.ndarray)) else body_nums
-                }
-                all_predictions.append(scene_data)
-    
-    return all_predictions
-
 def main():
     args = get_args()
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -292,7 +229,6 @@ def main():
     # 2. 数据加载和划分
     print(f"Loading Dataset ({args.scene_type})...")
     dataset = BlockTowerData(data_path=args.data_path, max_len=150, scene_type=args.scene_type)
-    trial_set = TrialData(data_path=args.data_path, max_len=150, scene_type=args.scene_type)
     
     # 划分训练集和验证集
     train_dataset, val_dataset, val_stable_indices, val_unstable_indices = dataset.split_train_val(
@@ -307,10 +243,6 @@ def main():
     # 创建验证集DataLoader
     val_batch_sampler = GroupedBatchSampler(val_dataset, batch_size=args.batch_size, shuffle=False)
     val_loader = DataLoader(val_dataset, batch_sampler=val_batch_sampler, num_workers=0)
-
-    # 创建实验试次集DataLoader
-    trial_batch_sampler = GroupedBatchSampler(trial_set, batch_size=args.batch_size, shuffle=False)
-    trial_loader = DataLoader(trial_set, batch_sampler=trial_batch_sampler, num_workers=0)
     
     optimizer = optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
@@ -478,12 +410,6 @@ def main():
     print(f"\nTraining completed! Best validation loss: {best_val_loss:.6f}")
     print(f"Training history saved to: {history_path}")
     logging.info(f"Training completed. Best validation loss: {best_val_loss:.6f}")
-
-    state_dict = torch.load(os.path.join(args.save_dir, 'model_best.pt'), map_location=device)
-    model.load_state_dict(state_dict)
-    trial_predictions = run_trial_set(model, trial_loader, criterion, device, args)
-    np.save(f"{args.save_dir}/trial_predictions.npy", trial_predictions)
-    print(f"Trial predictions saved to {args.save_dir}/trial_predictions.npy")
 
 if __name__ == "__main__":
     main()
