@@ -205,7 +205,7 @@ class TrialData(Dataset):
                 block_cnt = int(parts[2])
                 
                 # 每个config的stable场景中只有前10个是human实验用到的
-                if parts[3] == "stable" and int(parts[4]) >= 10:
+                if parts[3] == "stable" and int(parts[4].split('.')[0]) >= 10:
                     continue
                 
                 # 物体数量 = 积木数 + 1 (地面)
