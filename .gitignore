@@ -1,2 +1,8 @@
 /exps
 /data
+results/
+.vscode/
+*.sh
+*.zip
+val50steps.py
+__pycache__/
