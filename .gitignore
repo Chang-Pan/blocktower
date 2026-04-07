@@ -3,6 +3,11 @@
 results/
 .vscode/
 *.sh
-*.zip
 val50steps.py
 __pycache__/
+debug/
+correlation_analysis/
+trash_can/
+analysis_results/
+finetune/
+experimental_data/

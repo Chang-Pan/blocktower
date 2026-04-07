@@ -5,7 +5,7 @@ from torchdiffeq import odeint , odeint_adjoint
 
 from utils.util import *
 
-FEATURE_DIM = 11 # (x,y,z,qx,qy,qz,qw,lx,ly,lz,dynamic_mask)
+FEATURE_DIM = 10 # (x,y,z,rx,ry,rz,lx,ly,lz,dynamic_mask)
 
 class ForceFieldPredictor(nn.Module):
     """
@@ -33,8 +33,8 @@ class ForceFieldPredictor(nn.Module):
             trunk_input_dim = 10+3+3
 
         # 4. 计算 "Branch Net" (分支网络) 的输入维度
-        # 10(施力者几何特征): 只关心它是谁、在哪、多大
-        branch_input_dim = 10
+        # 3: 施力者的几何特征 (lx, ly, lz)，施力者的位置和朝向已经通过相对坐标系变换隐式编码了，所以分支网络只需要处理尺寸特征
+        branch_input_dim = 3
         
         # 5. 构建 Trunk Net (主干网络)
         trunk_layers = []
@@ -60,12 +60,9 @@ class ForceFieldPredictor(nn.Module):
         self.output_layer = nn.Linear(hidden_dim,6)
 
         # P.s: 如果需要单独建模地面对积木块的力，在这里单独加一个网络
-        # 输入是物体的所有几何特征 + 速度 + 角速度 + 显式计算距离？，输出是地面力的大小和方向
-        # 10+3+3 = 16维
-        if self.use_dist_input:
-            ground_input_dim = 10 + 3 + 3 + 1
-        else:
-            ground_input_dim = 10 + 3 + 3
+        # 输入是物体的所有几何特征 + 速度 + 角速度，输出是地面力的大小和方向
+        # 8(去除了x和y，因为地面应该具有平移不变性)+3+3 = 14维
+        ground_input_dim = 8 + 3 + 3
             
         self.ground_mlp = nn.Sequential(
             nn.Linear(ground_input_dim, hidden_dim),
@@ -97,9 +94,46 @@ class ForceFieldPredictor(nn.Module):
         Rotate vector v by inverse of quaternion q
         q_inv is (-x, -y, -z, w)
         """
-        q_conj = q.clone()
-        q_conj[..., :3] = -q_conj[..., :3]
+        q_conj = torch.cat([-q[..., :3], q[..., 3:4]], dim=-1)        
         return self.quat_rotate(q_conj, v)
+
+    def quat_multiply(self, q1, q2):
+        """
+        Hamilton product q1 * q2
+        q1, q2: [..., 4] in (x, y, z, w) format
+        """
+        x1, y1, z1, w1 = q1[..., 0], q1[..., 1], q1[..., 2], q1[..., 3]
+        x2, y2, z2, w2 = q2[..., 0], q2[..., 1], q2[..., 2], q2[..., 3]
+        
+        return torch.stack([
+            w1*x2 + x1*w2 + y1*z2 - z1*y2,
+            w1*y2 - x1*z2 + y1*w2 + z1*x2,
+            w1*z2 + x1*y2 - y1*x2 + z1*w2,
+            w1*w2 - x1*x2 - y1*y2 - z1*z2,
+        ], dim=-1)
+
+    def euler_to_quat(self, euler):
+        """
+        Convert Euler angles (rx, ry, rz) to quaternion (x, y, z, w)
+        euler: [..., 3] in radians
+        """
+        rx, ry, rz = euler[..., 0], euler[..., 1], euler[..., 2]
+        
+        cx = torch.cos(rx / 2)
+        sx = torch.sin(rx / 2)
+        cy = torch.cos(ry / 2)
+        sy = torch.sin(ry / 2)
+        cz = torch.cos(rz / 2)
+        sz = torch.sin(rz / 2)
+
+        q = torch.stack([
+            sx * cy * cz - cx * sy * sz,
+            cx * sy * cz + sx * cy * sz,
+            cx * cy * sz - sx * sy * cz,
+            cx * cy * cz + sx * sy * sz,
+        ], dim=-1)
+
+        return torch.nn.functional.normalize(q, p=2, dim=-1)
 
     def sdf_box(self, p, b):
         """
@@ -212,8 +246,8 @@ class ForceFieldPredictor(nn.Module):
     
     def forward(self, init_x,query_x,init_v,query_v,init_angular_v,query_angular_v, scene_scale=None):
         """
-        init_x: [batch, obj_num, 11] - objects applying force (x,y,z,qx,qy,qz,qw,lx,ly,lz,dynamic_mask)
-        query_x: [batch, target_obj_num, 11] - objects receiving force (x,y,z,qx,qy,qz,qw,lx,ly,lz,dynamic_mask)
+        init_x: [batch, obj_num, 10] - objects applying force (x,y,z,rx,ry,rz,lx,ly,lz,dynamic_mask)
+        query_x: [batch, target_obj_num, 10] - objects receiving force (x,y,z,rx,ry,rz,lx,ly,lz,dynamic_mask)
         init_v: [batch, target_obj_num, 3] - velocities of objects applying force (vx, vy, vz)
         query_v: [batch, obj_num, 3] - velocities of objects receiving force
         init_angular_v: [batch, target_obj_num, 3] - angular velocities of objects applying force (wx, wy, wz)
@@ -226,38 +260,57 @@ class ForceFieldPredictor(nn.Module):
 
         # expand to object pairs
         # 将 N 个施力者和 M 个受力者扩展成 NxM 的矩阵，以便两两配对
-        init_x_exp = init_x.unsqueeze(2).expand(-1, -1, target_obj_num, -1)  # [batch, obj_num, target_obj_num, 11]
-        query_x_exp = query_x.unsqueeze(1).expand(-1, obj_num, -1, -1)  # [batch, obj_num, target_obj_num, 11]
+        init_x_exp = init_x.unsqueeze(2).expand(-1, -1, target_obj_num, -1)  # [batch, obj_num, target_obj_num, 10]
+        query_x_exp = query_x.unsqueeze(1).expand(-1, obj_num, -1, -1)  # [batch, obj_num, target_obj_num, 10]
         init_v_exp = init_v.unsqueeze(2).expand(-1, -1, target_obj_num, -1) # [batch, obj_num, target_obj_num, 3]
         query_v_exp = query_v.unsqueeze(1).expand(-1, obj_num, -1, -1) # [batch, obj_num, target_obj_num, 3]
         init_angular_v_exp = init_angular_v.unsqueeze(2).expand(-1, -1, target_obj_num, -1) # [batch, obj_num, target_obj_num, 3]
         query_angular_v_exp = query_angular_v.unsqueeze(1).expand(-1, obj_num, -1, -1) # [batch, obj_num, target_obj_num, 3]
 
-        # apply relative position
-        relative_x = (query_x_exp[...,:3] - init_x_exp[...,:3]).clone() # [batch, obj_num, target_obj_num, 3]
-        query_x_exp = query_x_exp.clone()
-        query_x_exp[..., :3] = relative_x
+        # 欧拉角 -> 四元数（仅用于坐标变换和距离计算）
+        init_quat = self.euler_to_quat(init_x_exp[..., 3:6])  # [batch, obj_num, target_obj_num, 4]
+        query_quat = self.euler_to_quat(query_x_exp[..., 3:6])  # [batch, obj_num, target_obj_num, 4]
 
-        init_x_exp = init_x_exp.clone()
-        init_x_exp[..., :3] = 0
+        # 构造几何特征: [pos(3), quat(4), size(3), mask(1)] -> 11
+        init_geom = torch.cat([init_x_exp[..., 0:3], init_quat, init_x_exp[..., 6:10]], dim=-1)
+        query_geom = torch.cat([query_x_exp[..., 0:3], query_quat, query_x_exp[..., 6:10]], dim=-1)
 
-        # apply relative velocity
+        # 1. 相对位置到局部系
+        relative_x_world = (query_geom[...,:3] - init_geom[...,:3]).clone() # [batch, obj_num, target_obj_num, 3]
+        relative_x_local = self.quat_rotate_inv(init_quat, relative_x_world) # [batch, obj_num, target_obj_num, 3]
+
+        # 2. 受力者四元数到相对四元数：q_rel = q_init^{-1} * q_query
+        init_quat_conj = torch.cat([-init_quat[..., :3], init_quat[..., 3:4]], dim=-1)
+        q_rel = self.quat_multiply(init_quat_conj, query_quat) # [batch, obj_num, target_obj_num, 4]
+        query_geom_local = torch.cat([
+            relative_x_local,
+            q_rel,
+            query_geom[..., 7:],
+        ], dim=-1)
+
+        # 3. 施力者：位置变为原点，四元数为identity
+        identity_quat = torch.cat([
+            torch.zeros_like(init_quat[..., :3]),
+            torch.ones_like(init_quat[..., 3:4])
+        ], dim=-1)
+        init_geom_local = torch.cat([
+            torch.zeros_like(init_geom[...,:3]),
+            identity_quat,
+            init_geom[..., 7:],
+        ], dim=-1)
+
+        # 4. 相对线速度到局部系
         query_v_exp = query_v_exp.clone()
-        query_v_exp -= init_v_exp
+        rel_v_world = query_v_exp - init_v_exp
+        query_v_local = self.quat_rotate_inv(init_quat, rel_v_world)
 
-        # apply relative angular velocity
-        # Transform World Frame Angular Velocity Difference to Local Frame
-        # This aligns the rotation axis with the local coordinate system of the 'init' object
-        # init_quat: [batch, obj_num, target_obj_num, 4]
-        init_quat = init_x_exp[..., 3:7] 
-        # Calculate difference in world frame
+        # 5. 相对角速度到局部系
         rel_angular_v_world = query_angular_v_exp - init_angular_v_exp
-        # Rotate into local frame: R_inv * (w_query - w_init)
-        query_angular_v_exp = self.quat_rotate_inv(init_quat, rel_angular_v_world)
+        query_angular_v_local = self.quat_rotate_inv(init_quat, rel_angular_v_world)
 
         # calculate distance mask
         if self.use_dist_mask:
-            distance_to_capsule = self.compute_dist_mask(init_x_exp.clone(), query_x_exp.clone())
+            distance_to_capsule = self.compute_dist_mask(init_geom_local.clone(), query_geom_local.clone())
             
             boundary = self.dist_boundary
             if scene_scale is not None:
@@ -266,13 +319,18 @@ class ForceFieldPredictor(nn.Module):
             dist_mask = (distance_to_capsule <= boundary).float() # [batch, obj_num, target_obj_num, 1] 只有在距离小于等于boundary时才有力
             dist_input = distance_to_capsule * dist_mask
             dist_input *= self.dist_input_scale
+        
+        if self.debug_counter % 200 == 0 and self.use_dist_mask:
+            nonzero_ratio = (dist_mask > 0).float().mean().item()
+            print(f"[Mask] nonzero_ratio={nonzero_ratio:.4f} | dist min={distance_to_capsule.min().item():.4f} max={distance_to_capsule.max().item():.4f}", file=sys.stderr)
+
         # predict force
-        branch_input =  torch.cat([init_x_exp[...,:10]], dim=-1)  # [batch, obj_num, target_obj_num, 10]
+        branch_input =  torch.cat([init_geom_local[...,7:10]], dim=-1)  # [batch, obj_num, target_obj_num, 3]
         if self.use_dist_input:
-            trunk_input =  torch.cat([query_x_exp[...,:10], query_v_exp, query_angular_v_exp, dist_input], dim=-1)  # [batch, obj_num, target_obj_num, 10+3+3+1]
+            trunk_input =  torch.cat([query_geom_local[...,:10], query_v_local, query_angular_v_local, dist_input], dim=-1)  # [batch, obj_num, target_obj_num, 10+3+3+1]
         else:
-            trunk_input =  torch.cat([query_x_exp[...,:10], query_v_exp, query_angular_v_exp], dim=-1)  # [batch, obj_num, target_obj_num, 10+3+3]
-        branch_input_flat = branch_input.reshape(batch_size * obj_num * target_obj_num, branch_input.shape[-1])  # [batch * obj_num * target_obj_num, 10]
+            trunk_input =  torch.cat([query_geom_local[...,:10], query_v_local, query_angular_v_local], dim=-1)  # [batch, obj_num, target_obj_num, 10+3+3]
+        branch_input_flat = branch_input.reshape(batch_size * obj_num * target_obj_num, branch_input.shape[-1])  # [batch * obj_num * target_obj_num, 3]
         trunk_input_flat = trunk_input.reshape(batch_size * obj_num * target_obj_num, trunk_input.shape[-1])  # [batch * obj_num * target_obj_num, 10+3+3(+1)]
 
         branch_output = self.branch_net(branch_input_flat)
@@ -285,46 +343,32 @@ class ForceFieldPredictor(nn.Module):
         if self.use_dist_mask:
             force = force*dist_mask
 
+        # 将局部系力转换回世界系
+        init_quat_world = self.euler_to_quat(init_x.unsqueeze(2).expand(-1, -1, target_obj_num, -1)[..., 3:6])
+        force_linear_world = self.quat_rotate(init_quat_world, force[..., :3])
+        force_torque_world = self.quat_rotate(init_quat_world, force[..., 3:6])
+        force = torch.cat([force_linear_world, force_torque_world], dim=-1)
+
         # --- 新增: 预测地面力 ---
         # 不需要两两配对，只需要对每个受力物体(query objects)计算
         # query_x: [batch, target_obj_num, 11]
-        
-        # 1. 计算物体到地面的距离 (简单的 z 坐标, 假设地面是 z=0)
-        # 物体坐标是质心，我们需要考虑到底面的距离: z - lz/2
-        # 注意: 这里的物体朝向如果不是平的，最低点计算会复杂。
-        # 简化假设: 主要用于长方体平放堆叠，用 z - lz/2 近似，或者让神经网络自己通过 (z, quat, size) 去学。
-        # 为了让网络容易学，我们构造一个显式的 "height_above_ground" 特征
-        
-        obj_z = query_x[..., 2:3] # z
-        obj_lz = query_x[..., 9:10] # lz (full length in z-axis local?) -> 假设特征 7,8,9 是 lx, ly, lz
-        # 注意：你在 compute_dist_mask 里是用 query_x[..., 7:10] 作为 size。
-        # 这里为了保持一致，我们直接把所有几何特征扔进去，但额外构造一个 '离地特征'
-        
-        # 简单粗暴：如果 use_dist_input，我们传入 z 作为距离特征
-        # 因为地面在 z=0，距离就是 z (如果可以穿透则可能是负数，不取abs)
-        # 或者更精细一点：z - box_height_radius
-        # 暂时直接使用 z 坐标作为距离提示，网络会学到 offset
-        
-        ground_feat_input = query_x[..., :10] # 几何特征
+                
+        ground_feat_input = torch.cat([
+            query_x[..., 2:10]
+        ], dim=-1)
         ground_vel_input = query_v # 速度 [batch, target_obj_num, 3]
         ground_ang_vel_input = query_angular_v # 角速度
         
-        if self.use_dist_input:
-            # 缩放一下 z，使其在接触面附近数值较大/敏感
-            # 这里简单地把 z * scale 作为距离输入
-            dist_to_ground = query_x[..., 2:3] * self.dist_input_scale
-            ground_input = torch.cat([ground_feat_input, ground_vel_input, ground_ang_vel_input, dist_to_ground], dim=-1)
-        else:
-            ground_input = torch.cat([ground_feat_input, ground_vel_input, ground_ang_vel_input], dim=-1)
-            
+        ground_input = torch.cat([ground_feat_input, ground_vel_input, ground_ang_vel_input], dim=-1)
+        
         ground_force = self.ground_mlp(ground_input) # [batch, target_obj_num, 6]
         
         # 只有在接近地面时才生效? 
         # 可以加个 mask: if z > threshold, ground_force = 0
         # 但通常让神经网络学出来 zero force 更好，或者加上 soft mask
         # 这里加上简单的 soft mask 防止飞很高的物体还受到地面力
-        #ground_mask = (query_x[..., 2:3] < 1.0).float() # 假设积木不大，0.5m以上不太受地面力
-        #ground_force = ground_force * ground_mask
+        ground_mask = (query_x[..., 2:3] < 1.0).float() # 假设积木不大，0.5m以上不太受地面力
+        ground_force = ground_force * ground_mask
 
         # DEBUG: Force Stats
         self.debug_counter += 1
@@ -341,6 +385,11 @@ class ForceFieldPredictor(nn.Module):
             
         if torch.isnan(force).any():
             print("!!! [FFP] NaN detected in Force !!!", file=sys.stderr)
+
+        if self.debug_counter % 200 == 0:
+            pair_mag = force[..., :3].norm(dim=-1).mean().item()
+            g_mag = ground_force[..., :3].norm(dim=-1).mean().item()
+            print(f"[Force] pair_mean={pair_mag:.4f} | ground_mean={g_mag:.4f}", file=sys.stderr)
 
         return force, ground_force
 
@@ -386,27 +435,6 @@ class ODEFunc(nn.Module):
 
         all_features = z[:,:,:FEATURE_DIM] # [batch_size, obj_num, FEATURE_DIM]
 
-        # ===== 数值稳定性处理 =====
-        # 1. 归一化四元数 (防止ODE积分过程中偏离单位长度)
-        curr_quat = all_features[:, :, 3:7]
-        quat_norm = torch.norm(curr_quat, dim=-1, keepdim=True)
-        quat_norm = torch.clamp(quat_norm, min=1e-8)  # 防止除以零
-        curr_quat_normalized = curr_quat / quat_norm
-        all_features = all_features.clone()  # 避免就地修改
-        all_features[:, :, 3:7] = curr_quat_normalized
-        
-        # 2. 钳制速度和角速度 (防止数值爆炸)
-        velocities = torch.clamp(velocities, min=-100.0, max=100.0)
-        angular_v = torch.clamp(angular_v, min=-100.0, max=100.0)
-
-        # 在归一化后
-        # if t.item() == 0 and torch.rand(1).item() < 0.01:  # 1%概率打印
-        #     print(f"[Debug] Quat norm before: {torch.norm(curr_quat, dim=-1).mean():.6f}")
-        #     print(f"[Debug] Quat norm after: {torch.norm(curr_quat_normalized, dim=-1).mean():.6f}")
-        #     print(f"[Debug] Pos norm before: {torch.norm(curr_pos, dim=-1).mean():.6f}")
-        #     print(f"[Debug] Pos norm after: {torch.norm(curr_pos_normalized, dim=-1).mean():.6f}")
-        #     print(f"[Debug] Velocity range: [{velocities.min():.2f}, {velocities.max():.2f}]")
-
         pairwise_force, ground_force = self.force_predictor(
             init_x=all_features,
             query_x=all_features,
@@ -422,37 +450,22 @@ class ODEFunc(nn.Module):
         mask = 1- torch.eye(obj_num, device=z.device).unsqueeze(0) # [1, obj_num, obj_num]
         mask = mask.unsqueeze(-1) # [1, obj_num, obj_num, 1]
         pairwise_force = pairwise_force * mask # [batch_size, obj_num, obj_num, 6]
-        pairwise_force /= self.mass
+        pairwise_force = pairwise_force / self.mass
+        ground_force = ground_force / self.mass
+        
+        if self.debug_counter % 200 == 0:
+            v_min, v_max = velocities.min().item(), velocities.max().item()
+            w_min, w_max = angular_v.min().item(), angular_v.max().item()
+            print(f"[InputRange] v=[{v_min:.4f}, {v_max:.4f}] | w=[{w_min:.4f}, {w_max:.4f}]", file=sys.stderr)
 
-        # 计算导数，旋转的部分使用四元数导数公式 dq/dt = 0.5 * Omega * q
-        # 假设 angular_v 是世界坐标系下的角速度
-        
-        # 1. 提取当前四元数 (x, y, z, w)
-        curr_quat = all_features[:, :, 3:7] 
-        qx = curr_quat[..., 0]
-        qy = curr_quat[..., 1]
-        qz = curr_quat[..., 2]
-        qw = curr_quat[..., 3]
-        
-        # 2. 提取当前角速度 (wx, wy, wz)
-        wx = angular_v[..., 0]
-        wy = angular_v[..., 1]
-        wz = angular_v[..., 2]
-        
-        # 3. 计算四元数导数 (四元数乘法展开: Omega_world * q)
-        # d_q_x =  wx*qw + wy*qz - wz*qy
-        # d_q_y = -wx*qz + wy*qw + wz*qx
-        # d_q_z =  wx*qy - wy*qx + wz*qw
-        # d_q_w = -wx*qx - wy*qy - wz*qz
-        dq_x =  wx*qw + wy*qz - wz*qy
-        dq_y = -wx*qz + wy*qw + wz*qx
-        dq_z =  wx*qy - wy*qx + wz*qw
-        dq_w = -wx*qx - wy*qy - wz*qz
-        
-        dquat_dt = 0.5 * torch.stack([dq_x, dq_y, dq_z, dq_w], dim=-1)
+        #if self.debug_counter % 200 == 0:
+            #gf_z = ground_force[0, :, 2]  # batch=0, all objs, z-force
+            #expected = 9.8 / (self.scene_scale[0].item() if self.scene_scale is not None else 1.0)
+            #print(f"[Ground] z-force: {gf_z.mean().item():.4f} | expected: {expected:.4f}", file=sys.stderr)
+
 
         dxdt = velocities * dynamic_mask
-        dquat_dt = dquat_dt * dynamic_mask
+        deuler_dt = angular_v * dynamic_mask
 
         # 计算线性加速度
         #acceleration = pairwise_force[:,:,:,:3].sum(dim=1)
@@ -462,9 +475,8 @@ class ODEFunc(nn.Module):
 
         # 计算线性加速度
         acceleration_obj = pairwise_force[:,:,:,:3].sum(dim=1)
-        acceleration_ground = ground_force[:,:,:3] / self.mass
+        acceleration_ground = ground_force[:,:,:3]
         acceleration = acceleration_obj + acceleration_ground
-        
         if self.scene_scale is not None:
             # 根据场景缩放重调地面重力
             scaled_gravity = self.gravity / self.scene_scale.view(-1, 1) # 场景越大，重力越小（因为距离单位变大了）
@@ -473,13 +485,22 @@ class ODEFunc(nn.Module):
             # y是高度则是1，z是高度则是2
             acceleration[:,:,2] += self.gravity
         
+        if self.debug_counter % 200 == 0:
+            a_obj = acceleration_obj[..., 2].mean().item()
+            a_gnd = acceleration_ground[..., 2].mean().item()
+            g = (self.gravity / self.scene_scale.view(-1, 1)).mean().item() if self.scene_scale is not None else self.gravity.item()
+            a_net = acceleration[..., 2].mean().item()  # 已包含 gravity
+            print(
+                f"[Accel-z] obj={a_obj:.4f} | ground={a_gnd:.4f} | gravity={g:.4f} | net_after_g={a_net:.4f}",
+                file=sys.stderr
+            )        
         acceleration = acceleration * dynamic_mask
 
         if self.acceleration_clip > 0:
             acceleration = acceleration * (acceleration.abs() > self.acceleration_clip).float() # Deadzone filter
         
         # Safety clamp to prevent explosion
-        acceleration = torch.clamp(acceleration, min=-1e4, max=1e4)
+        # acceleration = torch.clamp(acceleration, min=-1e4, max=1e4)
 
         # 计算角加速度
         # dtheta_scale实际上是转动惯量的倒数的角色？但就是一个常数应该也可以，对于我们所有木块都一样，还是需要根据质量计算？
@@ -489,15 +510,15 @@ class ODEFunc(nn.Module):
         
         dangvdt = dangvdt_obj + dangvdt_ground
         # Safety clamp for angular acceleration
-        dangvdt = torch.clamp(dangvdt, min=-1e4, max=1e4) 
+        # dangvdt = torch.clamp(dangvdt, min=-1e4, max=1e4) 
         
         dangvdt = dangvdt * dynamic_mask
 
         dzdt = torch.cat([
             dxdt,  # derivative of position (3)
-            dquat_dt,  # derivative of quaternion (4)
-            torch.zeros_like(z[:,:,7:10]),  # keep size unchanged (3)
-            torch.zeros_like(z[:,:,10:FEATURE_DIM]),  # keep other features (dynamic_mask) unchanged (1)
+            deuler_dt, # derivative of euler angles (3)
+            torch.zeros_like(z[:,:,6:9]),  # keep size unchanged (3)
+            torch.zeros_like(z[:,:,9:FEATURE_DIM]),  # keep other features (dynamic_mask) unchanged (1)
             acceleration, # derivative of velocity (3)
             dangvdt, # derivative of angular velocity (3)，与torque保持一致维度
         ], dim=-1)
@@ -533,7 +554,10 @@ class ODEFunc(nn.Module):
             print("!!! [ODE] NaN detected in dzdt !!!", file=sys.stderr)
             print(f"  Accel NaNs: {torch.isnan(acceleration).sum()}", file=sys.stderr)
             print(f"  AngAcc NaNs: {torch.isnan(dangvdt).sum()}", file=sys.stderr)
-            print(f"  Pos/Quat Deriv NaNs: {torch.isnan(dxdt).sum()} / {torch.isnan(dquat_dt).sum()}", file=sys.stderr)
+            print(f"  Pos/Euler Deriv NaNs: {torch.isnan(dxdt).sum()} / {torch.isnan(deuler_dt).sum()}", file=sys.stderr)
+
+        if torch.isinf(dzdt).any():
+            print("!!! [ODE] Inf detected in dzdt !!!", file=sys.stderr)
 
         return dzdt
 
@@ -561,11 +585,4 @@ class NeuralODEModel(nn.Module):
         else:
             res = odeint(self.ode_func, z0, t,method=method,options={'step_size':self.step_size})  # [time_steps, batch_size, obj_num, FEATURE_DIM+6]
         res = res.permute(1,0,2,3) # [batch_size, time_steps, obj_num, FEATURE_DIM+6]
-        # ===== 输出后处理: 归一化四元数 =====
-        # 确保输出的四元数是归一化的
-        quat = res[..., 3:7]  # [batch, time, obj, 4]
-        quat_norm = torch.norm(quat, dim=-1, keepdim=True)
-        quat_norm = torch.clamp(quat_norm, min=1e-8)
-        res = res.clone()
-        res[..., 3:7] = quat / quat_norm
         return res

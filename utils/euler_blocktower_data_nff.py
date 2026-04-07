@@ -5,7 +5,7 @@ import os
 import glob
 from collections import defaultdict
 
-FEATURE_DIM = 11 
+FEATURE_DIM = 10 
 
 class BlockTowerData(Dataset):
     def __init__(self, data_path, max_len=150, scene_type='all'):
@@ -81,9 +81,9 @@ class BlockTowerData(Dataset):
             traj = traj[:, 1:, :] 
             
             # 拆分特征
-            body_prop = traj[:, :, 0:11]
-            vel = traj[:, :, 11:14]
-            ang_vel = traj[:, :, 14:17]
+            body_prop = traj[:, :, 0:10]
+            vel = traj[:, :, 10:13]
+            ang_vel = traj[:, :, 13:16]
             
             # 注意: 这里返回的 obj_num 已经是去掉了地面的数量 (在__init__里改了)
             return filename, body_prop, vel, ang_vel, obj_num
@@ -92,7 +92,7 @@ class BlockTowerData(Dataset):
             print(f"Error reading {file_path}: {e}")
             dummy_len = self.max_len
             return filename, \
-                   np.zeros((dummy_len, obj_num, 11), dtype=np.float32), \
+                   np.zeros((dummy_len, obj_num, 10), dtype=np.float32), \
                    np.zeros((dummy_len, obj_num, 3), dtype=np.float32), \
                    np.zeros((dummy_len, obj_num, 3), dtype=np.float32), \
                    obj_num
@@ -234,9 +234,9 @@ class TrialData(Dataset):
             traj = traj[:, 1:, :] 
             
             # 拆分特征
-            body_prop = traj[:, :, 0:11]
-            vel = traj[:, :, 11:14]
-            ang_vel = traj[:, :, 14:17]
+            body_prop = traj[:, :, 0:10]
+            vel = traj[:, :, 10:13]
+            ang_vel = traj[:, :, 13:16]
             
             # 注意: 这里返回的 obj_num 已经是去掉了地面的数量 (在__init__里改了)
             return filename, body_prop, vel, ang_vel, obj_num
@@ -245,7 +245,7 @@ class TrialData(Dataset):
             print(f"Error reading {file_path}: {e}")
             dummy_len = self.max_len
             return filename, \
-                   np.zeros((dummy_len, obj_num, 11), dtype=np.float32), \
+                   np.zeros((dummy_len, obj_num, 10), dtype=np.float32), \
                    np.zeros((dummy_len, obj_num, 3), dtype=np.float32), \
                    np.zeros((dummy_len, obj_num, 3), dtype=np.float32), \
                    obj_num
@@ -428,15 +428,15 @@ class DebugData(Dataset):
                 traj = traj[:self.max_len]
 
             traj = traj[:, 1:, :]  # remove ground
-            body_prop = traj[:, :, 0:11]
-            vel = traj[:, :, 11:14]
-            ang_vel = traj[:, :, 14:17]
+            body_prop = traj[:, :, 0:10]
+            vel = traj[:, :, 10:13]
+            ang_vel = traj[:, :, 13:16]
             return filename, body_prop, vel, ang_vel, obj_num
         except Exception as e:
             print(f"Error reading {file_path}: {e}")
             dummy_len = self.max_len
             return filename, \
-                   np.zeros((dummy_len, max(obj_num, 1), 11), dtype=np.float32), \
+                   np.zeros((dummy_len, max(obj_num, 1), 10), dtype=np.float32), \
                    np.zeros((dummy_len, max(obj_num, 1), 3), dtype=np.float32), \
                    np.zeros((dummy_len, max(obj_num, 1), 3), dtype=np.float32), \
                    obj_num

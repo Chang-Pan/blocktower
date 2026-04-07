@@ -45,59 +45,74 @@ def calculate_distribution(data):
         print(f'10^{bin} - 10^{bin+1}: {count/total_count:.4f}')
 
 
-def vis_losscurve(steps, log_file):
-    epochs = []
-    losses = []
-    mse_losses = []
-    residual_losses = []
-    residual_residual_losses = []
+def vis_losscurve(steps, log_file, eps=1e-8):
+    train_epochs = []
+    train_losses = []
+    val_epochs = []
+    val_losses = []
 
-    # Updated log pattern to capture all loss values
-    log_pattern = re.compile(r"Epoch\s*\[(\d+)/\d+\].*Loss:\s*([\d\.eE\-]+)\s*,\s*MSE:\s*([\d\.eE\-]+)\s*,\s*Residual\s*Loss:\s*([\d\.eE\-]+)\s*,\s*Residual\s*Residual\s*Loss:\s*([\d\.eE\-]+)")
-    # log_pattern = re.compile(r"Epoch\s*\[(\d+)/\d+\].*Loss:\s*([\d\.eE\-]+)\s*,\s*Time:\s*([\d\.eE\-]+)")
+    # 支持新日志格式:
+    # [TRAIN] Epoch [e/E] Loss: ..., MSE: ..., Residual Loss: ..., Residual Residual Loss: ...
+    # [VAL]   Epoch [e/E] Loss: ..., MSE: ..., Residual Loss: ..., Residual Residual Loss: ...
+    log_pattern = re.compile(
+        r"\[(TRAIN|VAL)\]\s*Epoch\s*\[(\d+)/\d+\].*Loss:\s*([\d\.eE\-]+)\s*,\s*MSE:\s*([\d\.eE\-]+)\s*,\s*Residual\s*Loss:\s*([\d\.eE\-]+)\s*,\s*Residual\s*Residual\s*Loss:\s*([\d\.eE\-]+)"
+    )
 
-    with open(log_file, 'r') as file:
+    with open(log_file, 'r', encoding='utf-8') as file:
         for line in file:
             match = log_pattern.search(line)
-            if match:
-                epoch = int(match.group(1))
-                loss = float(match.group(2))
-                mse_loss = float(match.group(3))
-                residual_loss = float(match.group(4))
-                residual_residual_loss = float(match.group(5))
+            if not match:
+                continue
 
-                # residual_loss = float(match.group(3))
-                # residual_residual_loss = float(match.group(3))
-                
-                epochs.append(epoch)
-                losses.append(loss)
-                mse_losses.append(mse_loss)
-                residual_losses.append(residual_loss)
-                residual_residual_losses.append(residual_residual_loss)
+            split_name = match.group(1)  # TRAIN or VAL
+            epoch = int(match.group(2))
+            loss = float(match.group(3))
 
-    # Apply log transformation to the losses
-    losses = np.log(losses)
-    mse_losses = np.log(mse_losses)
-    residual_losses = np.log(residual_losses)
-    residual_residual_losses = np.log(residual_residual_losses)
+            if split_name == "TRAIN":
+                train_epochs.append(epoch)
+                train_losses.append(loss)
+            else:
+                val_epochs.append(epoch)
+                val_losses.append(loss)
 
-    # Plot the loss curves
-    plt.figure(figsize=(10, 5))
-    plt.plot(epochs, losses, label='Loss')
-    plt.plot(epochs, mse_losses, label='MSE')
-    plt.plot(epochs, residual_losses, label='Residual Loss')
-    plt.plot(epochs, residual_residual_losses, label='Residual Residual Loss')
-    
-    # Labels and Title
-    plt.xlabel('Epoch')
-    plt.ylabel('Log Loss')
-    plt.title(f'Loss Curve for {steps} steps (log scale)')
-    plt.legend()
-    plt.grid(True)
+    if len(train_losses) == 0 and len(val_losses) == 0:
+        print("No TRAIN/VAL logs matched. Please check logging format.")
+        return
 
-    # Save the plot
-    log_file_path = log_file[:log_file.rfind('/')+1]
-    output_file = f'{log_file_path}loss_curve_{steps}.png'
+    # 防止 log(0)
+    train_losses_log = np.log(np.array(train_losses, dtype=np.float64) + eps) if len(train_losses) > 0 else np.array([])
+    val_losses_log = np.log(np.array(val_losses, dtype=np.float64) + eps) if len(val_losses) > 0 else np.array([])
+
+    # 分开画: 上图 train, 下图 val
+    fig, axes = plt.subplots(2, 1, figsize=(10, 8), sharex=False)
+
+    if len(train_losses) > 0:
+        axes[0].plot(train_epochs, train_losses_log, label='Train Loss (log)', color='tab:blue')
+        axes[0].set_title(f'Training Loss Curve for {steps} steps (log(loss+eps), eps={eps})')
+        axes[0].set_xlabel('Epoch')
+        axes[0].set_ylabel('Log Loss')
+        axes[0].grid(True)
+        axes[0].legend()
+    else:
+        axes[0].set_title('Training Loss Curve (No Data)')
+        axes[0].grid(True)
+
+    if len(val_losses) > 0:
+        axes[1].plot(val_epochs, val_losses_log, label='Validation Loss (log)', color='tab:orange')
+        axes[1].set_title(f'Validation Loss Curve for {steps} steps (log(loss+eps), eps={eps})')
+        axes[1].set_xlabel('Epoch')
+        axes[1].set_ylabel('Log Loss')
+        axes[1].grid(True)
+        axes[1].legend()
+    else:
+        axes[1].set_title('Validation Loss Curve (No Data)')
+        axes[1].grid(True)
+
+    plt.tight_layout()
+
+    import os
+    log_dir = os.path.dirname(log_file)
+    output_file = os.path.join(log_dir, f'loss_curve_split_{steps}.png')
     print(f'Saving plot to {output_file}')
     plt.savefig(output_file)
     plt.close()

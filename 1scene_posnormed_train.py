@@ -11,7 +11,8 @@ import importlib
 
 torch.autograd.set_detect_anomaly(True)
 
-from utils.blocktower_data_nff import BlockTowerData, GroupedBatchSampler, process_stacking_data_dynamic
+from utils.blocktower_data_nff import DebugData, process_stacking_data_dynamic
+from utils.util import vis_losscurve
 
 def get_args():
     parser = argparse.ArgumentParser()
@@ -21,16 +22,17 @@ def get_args():
     parser.add_argument('--seed', type=int, default=42)
     parser.add_argument('--epochs', type=int, default=100)
     parser.add_argument('--batch_size', type=int, default=16) 
-    parser.add_argument('--lr', type=float, default=1e-4)
+    parser.add_argument('--lr', type=float, default=1e-3)
+    parser.add_argument('--eta_min', type=float, default=1e-6, help='Minimum learning rate for scheduler')
     parser.add_argument('--weight_decay', type=float, default=1e-5)
     parser.add_argument('--hidden_dim', type=int, default=128)
     parser.add_argument('--layer_num', type=int, default=3)
     parser.add_argument('--segment_len', type=int, default=15, help='Number of simulation steps per segment, suggested 3-30 for training')
     parser.add_argument('--step_size', type=float, default=1/200, help='step size of ode solver')
-    parser.add_argument('--dist_boundary', type=float, default=0.02, help='Boundary of distance mask')
+    parser.add_argument('--dist_boundary', type=float, default=0.01, help='Boundary of distance mask')
     parser.add_argument('--use_dist_mask', action='store_true', default=True)
     parser.add_argument('--use_dist_input', action='store_true', default=True)
-    parser.add_argument('--use_adjoint', action='store_true', default=True, help='Use adjoint method for memory efficiency')
+    parser.add_argument('--use_adjoint', action='store_true', default=False, help='Use adjoint method for memory efficiency')
     parser.add_argument('--scene_type', type=str, default='all', choices=['all', 'stable', 'unstable'], 
                        help='Filter dataset by scene type')
     parser.add_argument('--val_ratio', type=float, default=0.2, help='Validation set ratio')
@@ -42,6 +44,7 @@ def get_args():
     parser.add_argument('--vis_unstable_scenes', type=int, default=3, 
                        help='Number of unstable scenes to save for visualization')
     args = parser.parse_args()
+    args.batch_size = 1  # 强制使用 batch_size=1，先排查问题
     return args
 
 def count_parameters(model):
@@ -83,11 +86,13 @@ def validate_epoch(model, val_loader, criterion, device, args, save_predictions=
             scale_view = scene_scale.view(-1, 1, 1, 1) # [batch, 1, 1, 1]
 
             # 备份原始数据用于 True Trajectory (在保存可视化时用到)
-            # 注意: body_prop 会被就地修改，这里深拷贝一份需要保存的部分
-            # 实际上我们需要保存完整的原始 true trajectory 用于对比
+            # 注意: 深拷贝一份以防被原地修改
             true_traj_orig_full = torch.cat([body_prop, vel, ang_vel], dim=-1).clone() # [Batch, Time, Obj, 17]
 
-            # 执行归一化
+            # 执行归一化 (克隆避免原地修改污染原数据集缓存)
+            body_prop = body_prop.clone()
+            vel = vel.clone()
+            
             body_prop[..., 0:3] /= scale_view   # Position
             body_prop[..., 7:10] /= scale_view  # Size
             vel /= scale_view                   # Velocity
@@ -149,16 +154,16 @@ def validate_epoch(model, val_loader, criterion, device, args, save_predictions=
                     }
                     
                     # 分类保存
-                    if is_stable and len(stable_scenes) < args.vis_stable_scenes:
-                        stable_scenes.append(scene_data)
-                    elif is_unstable and len(unstable_scenes) < args.vis_unstable_scenes:
-                        unstable_scenes.append(scene_data)
+                    if is_stable:
+                        # 放宽限制：Debug时一律最多各存3个，不强制配平数量
+                        if len(stable_scenes) < 3: stable_scenes.append(scene_data)
+                    else:
+                        if len(unstable_scenes) < 3: unstable_scenes.append(scene_data)
                     
-                    # 如果已经收集够了,标记但不能break
-                    if (len(stable_scenes) >= args.vis_stable_scenes and 
-                        len(unstable_scenes) >= args.vis_unstable_scenes):
+                    # Debug模式下：只要存了我们想要的极简数据集(最多凑够6个用来看位置是否正确)，就够了
+                    if len(stable_scenes) + len(unstable_scenes) >= 6:
                         if not collected_enough:
-                            print(f"  Collected enough scenes for visualization: "
+                            print(f"  Collected debug scenes for visualization: "
                                 f"{len(stable_scenes)} stable, {len(unstable_scenes)} unstable")
                         collected_enough = True
 
@@ -203,8 +208,17 @@ def main():
     try:
         model_module = importlib.import_module(args.model_name)
     except ImportError:
-        import models.posnormed_neural_simulator as model_module
-        
+        # 兼容传入短名: euler_neural_simulator -> models.euler_neural_simulator
+        try:
+            model_module = importlib.import_module(f"models.{args.model_name}")
+        except ImportError as e:
+            raise ImportError(
+                f"Cannot import model '{args.model_name}'. "
+                f"Try --model_name models.euler_neural_simulator"
+            ) from e
+
+    print(f"Loaded model module: {model_module.__name__}")    
+
     ForceFieldPredictor = model_module.ForceFieldPredictor
     ODEFunc = model_module.ODEFunc
     NeuralODEModel = model_module.NeuralODEModel
@@ -228,24 +242,17 @@ def main():
     
     # 2. 数据加载和划分
     print(f"Loading Dataset ({args.scene_type})...")
-    dataset = BlockTowerData(data_path=args.data_path, max_len=150, scene_type=args.scene_type)
+    dataset = DebugData(data_path=args.data_path, max_len=150, single_scene=True, block_cnt=2, scene_type='unstable')
     
-    # 划分训练集和验证集
-    train_dataset, val_dataset, val_stable_indices, val_unstable_indices = dataset.split_train_val(
-        val_ratio=args.val_ratio,
-        seed=args.seed
-    )
+    # 为了过拟合测试，训练集和验证集使用同一个绝对单一的数据集 (不划分)
+    val_stable_indices, val_unstable_indices = [], [] # 占位符防报错
     
-    # 创建训练集DataLoader
-    train_batch_sampler = GroupedBatchSampler(train_dataset, batch_size=args.batch_size, shuffle=True)
-    train_loader = DataLoader(train_dataset, batch_sampler=train_batch_sampler, num_workers=0)
-    
-    # 创建验证集DataLoader
-    val_batch_sampler = GroupedBatchSampler(val_dataset, batch_size=args.batch_size, shuffle=False)
-    val_loader = DataLoader(val_dataset, batch_sampler=val_batch_sampler, num_workers=0)
+    # 创建训练集和验证集DataLoader (关闭shuffle，batch固定为1)
+    train_loader = DataLoader(dataset, batch_size=1, shuffle=False, num_workers=0)
+    val_loader = DataLoader(dataset, batch_size=1, shuffle=False, num_workers=0)
     
     optimizer = optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
-    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs, eta_min=args.eta_min)
     criterion = nn.MSELoss()
     
     print("Start Training...")
@@ -290,6 +297,9 @@ def main():
             scene_scale = torch.clamp(scene_scale, min=1.0)
             scale_view = scene_scale.view(-1, 1, 1, 1)
 
+            body_prop = body_prop.clone()
+            vel = vel.clone()
+            
             body_prop[..., 0:3] /= scale_view
             body_prop[..., 7:10] /= scale_view
             vel /= scale_view
@@ -329,6 +339,28 @@ def main():
             
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            if batch_idx == 0 and (epoch + 1) % 5 == 0:
+                fp = model.ode_func.force_predictor
+
+                b_grad = fp.branch_net[0].weight.grad
+                t_grad = fp.trunk_net[0].weight.grad
+
+                # ground_mlp: [Linear, ReLU, Linear, ReLU, Linear]
+                g0_grad = fp.ground_mlp[0].weight.grad   # first linear
+                g2_grad = fp.ground_mlp[2].weight.grad   # middle linear
+                g4_grad = fp.ground_mlp[4].weight.grad   # last linear
+
+                b_norm = b_grad.norm().item() if b_grad is not None else 0.0
+                t_norm = t_grad.norm().item() if t_grad is not None else 0.0
+                g0_norm = g0_grad.norm().item() if g0_grad is not None else 0.0
+                g2_norm = g2_grad.norm().item() if g2_grad is not None else 0.0
+                g4_norm = g4_grad.norm().item() if g4_grad is not None else 0.0
+
+                print(
+                    f"[Grad] branch_l0={b_norm:.6e} | trunk_l0={t_norm:.6e} | "
+                    f"ground_l0={g0_norm:.6e} | ground_l1={g2_norm:.6e} | ground_l2={g4_norm:.6e}"
+                )
+            
             optimizer.step()
             
             epoch_loss += loss.item()
@@ -337,12 +369,19 @@ def main():
             #                  f"(Pos: {loss_pos:.6f}, Quat: {loss_quat:.6f}) ")
             
             if (batch_idx + 1) % 10 == 0 or batch_idx == 0:
-                print(f"Epoch [{epoch+1}/{args.epochs}] Step [{batch_idx+1}/{len(train_loader)}] Loss: {loss.item():.6f}")
+                print(f"Epoch [{epoch+1}/{args.epochs}] Loss: {loss.item():.6f} "
+                      f"(Pos: {loss_pos.item():.6f}, Quat: {loss_quat.item():.6f})")
         
         avg_train_loss = epoch_loss / len(train_loader)
         time_elapsed = time.time() - start_time
         train_history['train_loss'].append(avg_train_loss)
-        
+
+        # 新增: 每个 epoch 都记录 TRAIN loss（供画图分离）
+        logging.info(
+            f"[TRAIN] Epoch [{epoch+1}/{args.epochs}] Loss: {avg_train_loss:.8f}, "
+            f"MSE: {avg_train_loss:.8f}, Residual Loss: 0.0, Residual Residual Loss: 0.0"
+        )
+
         # 验证阶段
         if (epoch + 1) % args.val_interval == 0 or epoch == args.epochs - 1:
             # 先运行验证计算损失
@@ -358,46 +397,44 @@ def main():
                   f"Val Loss: {val_loss:.6f} (Pos: {val_loss_pos:.6f}, Quat: {val_loss_quat:.6f}) | "
                   f"Time: {time_elapsed:.2f}s")
             
-            logging.info(f"Epoch {epoch+1}, Train Loss: {avg_train_loss:.6f}, "
-                        f"Val Loss: {val_loss:.6f}, Val Pos: {val_loss_pos:.6f}, "
-                        f"Val Quat: {val_loss_quat:.6f}")
-            
+            logging.info(
+                f"[VAL] Epoch [{epoch+1}/{args.epochs}] Loss: {val_loss:.8f}, "
+                f"MSE: {val_loss_pos:.8f}, Residual Loss: {val_loss_quat:.8f}, "
+                f"Residual Residual Loss: 0.0"
+            )
+
             # 保存最佳模型
             if val_loss < best_val_loss:
                 best_val_loss = val_loss
                 torch.save(model.state_dict(), os.path.join(args.save_dir, 'model_best.pt'))
                 print(f"  --> New best model saved! (Val Loss: {val_loss:.6f})")
-                logging.info(f"New best model saved at epoch {epoch+1}")
                 
-                # 只在最佳模型时保存可视化数据
-                if args.save_vis_data:
-                    print(f"  --> Collecting visualization data for best model...")
-                    # 重新运行验证以收集可视化数据
-                    _, _, _, predictions = validate_epoch(
-                        model, val_loader, criterion, device, args, save_predictions=True
-                    )
-                    
-                    vis_save_path = os.path.join(vis_dir, f'validation_best_epoch{epoch+1}.npz')
-                    np.savez(vis_save_path,
-                            stable_scenes=predictions['stable_scenes'],
-                            unstable_scenes=predictions['unstable_scenes'],
-                            val_stable_indices=val_stable_indices,
-                            val_unstable_indices=val_unstable_indices,
-                            epoch=epoch+1,
-                            val_loss=val_loss,
-                            args=vars(args))
-                    print(f"  --> Visualization data saved: {vis_save_path}")
-                    print(f"      ({len(predictions['stable_scenes'])} stable, {len(predictions['unstable_scenes'])} unstable scenes)")
+            # [修改] 不管是不是best，只要需要保存数据，每 20 个 epochs 强制存一次，用于动态观察动作
+            if args.save_vis_data and ((epoch + 1) % 10 == 0 or epoch == args.epochs - 1):
+                print(f"  --> Collecting visualization data...")
+                # 重新运行验证以收集可视化数据
+                _, _, _, predictions = validate_epoch(
+                    model, val_loader, criterion, device, args, save_predictions=True
+                )
+                
+                vis_save_path = os.path.join(vis_dir, f'debug_vis_epoch{epoch+1}.npz')
+                np.savez(vis_save_path,
+                        stable_scenes=predictions['stable_scenes'],
+                        unstable_scenes=predictions['unstable_scenes'],
+                        epoch=epoch+1,
+                        val_loss=val_loss,
+                        args=vars(args))
+                print(f"  --> Visualization data saved: {vis_save_path}")
+                print(f"      ({len(predictions['stable_scenes'])} stable, {len(predictions['unstable_scenes'])} unstable scenes)")
                 
         else:
             print(f"Epoch [{epoch+1}/{args.epochs}] Train Loss: {avg_train_loss:.6f} | "
                   f"Time: {time_elapsed:.2f}s")
-            logging.info(f"Epoch {epoch+1}, Train Loss: {avg_train_loss:.6f}")
         
         scheduler.step()
         
         # 定期保存checkpoint
-        if (epoch + 1) % 20 == 0:
+        if (epoch + 1) % 10 == 0:
             torch.save(model.state_dict(), os.path.join(args.save_dir, f'model_epoch_{epoch+1}.pt'))
 
     # 保存最终模型
@@ -409,7 +446,13 @@ def main():
     
     print(f"\nTraining completed! Best validation loss: {best_val_loss:.6f}")
     print(f"Training history saved to: {history_path}")
-    logging.info(f"Training completed. Best validation loss: {best_val_loss:.6f}")
+    
+    # 训练结束后，使用你 utils 里的函数自动画 Loss Curve (保存为图片)
+    log_file_path = os.path.join(args.save_dir, 'train.log')
+    try:
+        vis_losscurve(steps=args.epochs, log_file=log_file_path)
+    except Exception as e:
+        print(f"Error drawing loss curve: {e}")
 
 if __name__ == "__main__":
     main()
