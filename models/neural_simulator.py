@@ -349,11 +349,12 @@ class ForceFieldPredictor(nn.Module):
         
         ground_force = self.ground_mlp(ground_input) # [batch, target_obj_num, 6]
         
-        # 只有在接近地面时才生效? 
-        # 可以加个 mask: if z > threshold, ground_force = 0
-        # 但通常让神经网络学出来 zero force 更好，或者加上 soft mask
-        # 这里加上简单的 soft mask 防止飞很高的物体还受到地面力
-        ground_mask = (query_x[..., 2:3] < 1.0).float() # 假设积木不大，0.5m以上不太受地面力
+        # soft mask: 只有接近地面的物体才受地面力
+        ground_threshold = 1.0  # 真实空间阈值(米)
+        if scene_scale is not None:
+            # 位置已归一化(除以scene_scale)，阈值也需要同样缩放
+            ground_threshold = ground_threshold / scene_scale.view(-1, 1, 1)
+        ground_mask = (query_x[..., 2:3] < ground_threshold).float()
         ground_force = ground_force * ground_mask
 
         # DEBUG: Force Stats
