@@ -14,6 +14,12 @@ torch.autograd.set_detect_anomaly(True)
 from utils.blocktower_data_nff import DebugData, process_stacking_data_dynamic
 from utils.util import vis_losscurve
 
+def quaternion_loss(pred_q, true_q):
+    """Sign-aware quaternion MSE: q and -q represent the same rotation."""
+    dot = (pred_q * true_q).sum(dim=-1, keepdim=True)
+    pred_q = torch.where(dot < 0, -pred_q, pred_q)
+    return torch.mean((pred_q - true_q) ** 2)
+
 def get_args():
     parser = argparse.ArgumentParser()
     parser.add_argument('--data_path', type=str, default='/mnt/nfs_project_a/chang/small_data/data/blocktower', help='Path to the dataset folder containing .npy files')
@@ -120,7 +126,7 @@ def validate_epoch(model, val_loader, criterion, device, args, save_predictions=
             true_quat = true_traj[..., 3:7]
 
             loss_pos = criterion(pred_pos, true_pos)
-            loss_quat = criterion(pred_quat, true_quat)
+            loss_quat = quaternion_loss(pred_quat, true_quat)
             loss = loss_pos + args.quat_loss_weight * loss_quat
 
             val_loss += loss.item()
@@ -339,8 +345,11 @@ def main():
             true_pos = true_traj_s[..., 0:3]
             true_quat = true_traj_s[..., 3:7]
 
-            loss_pos = criterion(pred_pos, true_pos)
-            loss_quat = criterion(pred_quat, true_quat)
+            # 时间加权：后期帧权重更高（线性从0.5到1.5）
+            n_steps = pred_pos.shape[1]
+            time_w = torch.linspace(0.5, 1.5, n_steps, device=device).view(1, -1, 1, 1)
+            loss_pos = torch.mean((pred_pos - true_pos) ** 2 * time_w)
+            loss_quat = quaternion_loss(pred_quat, true_quat)
             loss = loss_pos + args.quat_loss_weight * loss_quat
 
             loss.backward()

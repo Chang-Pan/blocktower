@@ -313,13 +313,15 @@ class ForceFieldPredictor(nn.Module):
         if need_distance:
             distance_to_capsule = self.compute_dist_mask(init_geom_local.clone(), query_geom_local.clone())
 
-        # distance mask: zero out forces for far-away pairs
+        # distance mask: soft sigmoid falloff for far-away pairs
         dist_mask = None
         if self.use_dist_mask:
             boundary = self.dist_boundary
             if scene_scale is not None:
                 boundary = self.dist_boundary / scene_scale.view(-1, 1, 1, 1)
-            dist_mask = (distance_to_capsule <= boundary).float()
+            # Smooth sigmoid: 1 when distance << boundary, 0 when distance >> boundary
+            transition = boundary * 0.5
+            dist_mask = torch.sigmoid((boundary - distance_to_capsule) / transition.clamp(min=1e-6) * 5)
 
         # distance as input feature to trunk net (independent of mask)
         if self.use_dist_input:
@@ -374,12 +376,12 @@ class ForceFieldPredictor(nn.Module):
         
         ground_force = self.ground_mlp(ground_input) # [batch, target_obj_num, 6]
         
-        # soft mask: 只有接近地面的物体才受地面力
+        # soft mask: 接近地面的物体受地面力，sigmoid平滑过渡
         ground_threshold = 1.0  # 真实空间阈值(米)
         if scene_scale is not None:
-            # 位置已归一化(除以scene_scale)，阈值也需要同样缩放
             ground_threshold = ground_threshold / scene_scale.view(-1, 1, 1)
-        ground_mask = (query_x[..., 2:3] < ground_threshold).float()
+        ground_transition = ground_threshold * 0.3
+        ground_mask = torch.sigmoid((ground_threshold - query_x[..., 2:3]) / ground_transition.clamp(min=1e-6) * 5)
         ground_force = ground_force * ground_mask
 
         # DEBUG: Force Stats

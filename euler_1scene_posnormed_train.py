@@ -338,7 +338,10 @@ def main():
             true_pos = true_traj_s[..., 0:3]
             true_euler = true_traj_s[..., 3:6]
 
-            loss_pos = criterion(pred_pos, true_pos)
+            # 时间加权：后期帧权重更高（线性从0.5到1.5）
+            n_steps = pred_pos.shape[1]
+            time_w = torch.linspace(0.5, 1.5, n_steps, device=device).view(1, -1, 1, 1)
+            loss_pos = torch.mean((pred_pos - true_pos) ** 2 * time_w)
             loss_euler = criterion(pred_euler, true_euler)
             loss = loss_pos + args.euler_loss_weight * loss_euler
 
