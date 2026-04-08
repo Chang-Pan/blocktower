@@ -308,21 +308,32 @@ class ForceFieldPredictor(nn.Module):
         rel_angular_v_world = query_angular_v_exp - init_angular_v_exp
         query_angular_v_local = self.quat_rotate_inv(init_quat, rel_angular_v_world)
 
-        # calculate distance mask
-        if self.use_dist_mask:
+        # calculate distance (needed by both dist_input and dist_mask independently)
+        need_distance = self.use_dist_mask or self.use_dist_input
+        if need_distance:
             distance_to_capsule = self.compute_dist_mask(init_geom_local.clone(), query_geom_local.clone())
-            
+
+        # distance mask: zero out forces for far-away pairs
+        dist_mask = None
+        if self.use_dist_mask:
             boundary = self.dist_boundary
             if scene_scale is not None:
-                boundary = self.dist_boundary / scene_scale.view(-1, 1, 1, 1) # 根据场景缩放距离边界
-            
-            dist_mask = (distance_to_capsule <= boundary).float() # [batch, obj_num, target_obj_num, 1] 只有在距离小于等于boundary时才有力
-            dist_input = distance_to_capsule * dist_mask
-            dist_input *= self.dist_input_scale
-        
-        if self.debug_counter % 200 == 0 and self.use_dist_mask:
-            nonzero_ratio = (dist_mask > 0).float().mean().item()
-            print(f"[Mask] nonzero_ratio={nonzero_ratio:.4f} | dist min={distance_to_capsule.min().item():.4f} max={distance_to_capsule.max().item():.4f}", file=sys.stderr)
+                boundary = self.dist_boundary / scene_scale.view(-1, 1, 1, 1)
+            dist_mask = (distance_to_capsule <= boundary).float()
+
+        # distance as input feature to trunk net (independent of mask)
+        if self.use_dist_input:
+            if dist_mask is not None:
+                dist_input = distance_to_capsule * dist_mask * self.dist_input_scale
+            else:
+                dist_input = distance_to_capsule * self.dist_input_scale
+
+        if self.debug_counter % 200 == 0 and need_distance:
+            if dist_mask is not None:
+                nonzero_ratio = (dist_mask > 0).float().mean().item()
+                print(f"[Mask] nonzero_ratio={nonzero_ratio:.4f} | dist min={distance_to_capsule.min().item():.4f} max={distance_to_capsule.max().item():.4f}", file=sys.stderr)
+            else:
+                print(f"[Dist] min={distance_to_capsule.min().item():.4f} max={distance_to_capsule.max().item():.4f}", file=sys.stderr)
 
         # predict force
         branch_input =  torch.cat([init_geom_local[...,7:10]], dim=-1)  # [batch, obj_num, target_obj_num, 3]
@@ -340,8 +351,8 @@ class ForceFieldPredictor(nn.Module):
         force_flat = self.output_layer(branch_output * trunk_output)
         force = force_flat.reshape(batch_size, obj_num, target_obj_num, 6)  # [batch, obj_num, target_obj_num, 6]
 
-        if self.use_dist_mask:
-            force = force*dist_mask
+        if dist_mask is not None:
+            force = force * dist_mask
 
         # 将局部系力转换回世界系
         init_quat_world = self.euler_to_quat(init_x.unsqueeze(2).expand(-1, -1, target_obj_num, -1)[..., 3:6])

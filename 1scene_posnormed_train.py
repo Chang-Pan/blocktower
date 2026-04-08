@@ -29,7 +29,7 @@ def get_args():
     parser.add_argument('--layer_num', type=int, default=4)
     parser.add_argument('--segment_len', type=int, default=15, help='Number of simulation steps per segment, suggested 3-30 for training')
     parser.add_argument('--step_size', type=float, default=1/400, help='step size of ode solver (smaller = more accurate integration)')
-    parser.add_argument('--dist_boundary', type=float, default=0.05, help='Boundary of distance mask (larger = more interactions allowed)')
+    parser.add_argument('--dist_boundary', type=float, default=0.02, help='Boundary of distance mask')
     parser.add_argument('--use_dist_mask', action='store_true', default=True)
     parser.add_argument('--use_dist_input', action='store_true', default=True)
     parser.add_argument('--use_adjoint', action='store_true', default=False, help='Use adjoint method for memory efficiency')
