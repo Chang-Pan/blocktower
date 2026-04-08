@@ -66,7 +66,7 @@ sbatch <<'SBATCH_EOF'
 echo "=== Exp 2: euler_baseline === $(date)"
 echo "Node: $(hostname) | GPU: $CUDA_VISIBLE_DEVICES"
 
-python 1scene_posnormed_train.py \
+python euler_1scene_posnormed_train.py \
     --data_path /mnt/nfs_project_a/chang/data_euler/data_euler/blocktower \
     --save_dir exps/euler_baseline \
     --model_name euler_neural_simulator \
@@ -78,7 +78,7 @@ python 1scene_posnormed_train.py \
     --step_size 0.0025 \
     --dist_boundary 0.02 \
     --weight_decay 1e-5 \
-    --quat_loss_weight 0.1 \
+    --euler_loss_weight 0.1 \
     --seed 42
 
 echo "=== Exp 2 Done === $(date)"
@@ -183,7 +183,7 @@ sbatch <<'SBATCH_EOF'
 echo "=== Exp 5: euler_high_lr === $(date)"
 echo "Node: $(hostname) | GPU: $CUDA_VISIBLE_DEVICES"
 
-python 1scene_posnormed_train.py \
+python euler_1scene_posnormed_train.py \
     --data_path /mnt/nfs_project_a/chang/data_euler/data_euler/blocktower \
     --save_dir exps/euler_high_lr \
     --model_name euler_neural_simulator \
@@ -195,7 +195,7 @@ python 1scene_posnormed_train.py \
     --step_size 0.0025 \
     --dist_boundary 0.02 \
     --weight_decay 0 \
-    --quat_loss_weight 0.1 \
+    --euler_loss_weight 0.1 \
     --seed 42
 
 echo "=== Exp 5 Done === $(date)"

@@ -20,19 +20,20 @@ def get_args():
     parser.add_argument('--save_dir', type=str, default='exps/posnormed')
     parser.add_argument('--model_name', type=str, default='euler_neural_simulator')
     parser.add_argument('--seed', type=int, default=42)
-    parser.add_argument('--epochs', type=int, default=100)
+    parser.add_argument('--epochs', type=int, default=500)
     parser.add_argument('--batch_size', type=int, default=16) 
     parser.add_argument('--lr', type=float, default=1e-3)
-    parser.add_argument('--eta_min', type=float, default=1e-6, help='Minimum learning rate for scheduler')
+    parser.add_argument('--eta_min', type=float, default=1e-5, help='Minimum learning rate for scheduler')
     parser.add_argument('--weight_decay', type=float, default=1e-5)
-    parser.add_argument('--hidden_dim', type=int, default=128)
-    parser.add_argument('--layer_num', type=int, default=3)
+    parser.add_argument('--hidden_dim', type=int, default=256)
+    parser.add_argument('--layer_num', type=int, default=4)
     parser.add_argument('--segment_len', type=int, default=15, help='Number of simulation steps per segment, suggested 3-30 for training')
-    parser.add_argument('--step_size', type=float, default=1/200, help='step size of ode solver')
-    parser.add_argument('--dist_boundary', type=float, default=0.01, help='Boundary of distance mask')
+    parser.add_argument('--step_size', type=float, default=1/400, help='step size of ode solver (smaller = more accurate integration)')
+    parser.add_argument('--dist_boundary', type=float, default=0.02, help='Boundary of distance mask')
     parser.add_argument('--use_dist_mask', action='store_true', default=True)
     parser.add_argument('--use_dist_input', action='store_true', default=True)
-    parser.add_argument('--use_adjoint', action='store_true', default=True, help='Use adjoint method for memory efficiency')
+    parser.add_argument('--use_adjoint', action='store_true', default=False, help='Use adjoint method for memory efficiency')
+    parser.add_argument('--euler_loss_weight', type=float, default=0.1, help='Weight for euler rotation loss relative to position loss')
     parser.add_argument('--scene_type', type=str, default='all', choices=['all', 'stable', 'unstable'], 
                        help='Filter dataset by scene type')
     parser.add_argument('--val_ratio', type=float, default=0.2, help='Validation set ratio')
@@ -44,10 +45,7 @@ def get_args():
     parser.add_argument('--vis_unstable_scenes', type=int, default=3, 
                        help='Number of unstable scenes to save for visualization')
     args = parser.parse_args()
-    args.use_adjoint = False  # 强制关闭 adjoint，先排查问题
-    args.batch_size = 1  # 强制使用 batch_size=1，先排查问题
-    args.segment_len = 15  # 强制使用全段训练，先排查问题
-    args.weight_decay = 0.0  # 强制关闭权重衰减，先排查问题
+    args.batch_size = 1  # 强制使用 batch_size=1，1-scene overfit
     return args
 
 def count_parameters(model):
@@ -123,8 +121,8 @@ def validate_epoch(model, val_loader, criterion, device, args, save_predictions=
 
             loss_pos = criterion(pred_pos, true_pos)
             loss_euler = criterion(pred_euler, true_euler)
-            loss = loss_pos + loss_euler
-            
+            loss = loss_pos + args.euler_loss_weight * loss_euler
+
             val_loss += loss.item()
             val_loss_pos += loss_pos.item()
             val_loss_euler += loss_euler.item()
@@ -255,7 +253,7 @@ def main():
     val_loader = DataLoader(dataset, batch_size=1, shuffle=False, num_workers=0)
     
     optimizer = optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
-    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs, eta_min=args.eta_min)
+    scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer, T_0=100, T_mult=2, eta_min=args.eta_min)
     criterion = nn.MSELoss()
     
     print("Start Training...")
@@ -269,8 +267,12 @@ def main():
     # 记录训练历史
     train_history = {'train_loss': [], 'val_loss': [], 'val_loss_pos': [], 'val_loss_euler': []}
     
+    # Curriculum learning: 渐进增加segment长度，减少rollout误差累积
     curriculum_schedule = [
-        (100, args.segment_len),   # 0-99, len=segment_len
+        (50, 5),      # epoch 0-49:  先用极短片段
+        (150, 10),    # epoch 50-149: 逐渐增加到10帧
+        (300, 15),    # epoch 150-299: 标准片段长度
+        (args.epochs, 30),  # epoch 300+: 更长rollout
     ]
 
     for epoch in range(args.epochs):
@@ -338,8 +340,8 @@ def main():
 
             loss_pos = criterion(pred_pos, true_pos)
             loss_euler = criterion(pred_euler, true_euler)
-            loss = loss_pos + loss_euler    
-            
+            loss = loss_pos + args.euler_loss_weight * loss_euler
+
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             if batch_idx == 0 and (epoch + 1) % 5 == 0:
