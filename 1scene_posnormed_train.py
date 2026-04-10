@@ -340,6 +340,9 @@ def main():
     
     # 记录最佳验证损失
     best_val_loss = float('inf')
+    best_epoch = -1
+    best_val_pos = float('inf')
+    best_val_quat = float('inf')
     
     # 记录训练历史
     train_history = {'train_loss': [], 'val_loss': [], 'val_loss_pos': [], 'val_loss_quat': []}
@@ -496,8 +499,14 @@ def main():
             # 保存最佳模型
             if val_loss < best_val_loss:
                 best_val_loss = val_loss
+                best_epoch = epoch + 1
+                best_val_pos = val_loss_pos
+                best_val_quat = val_loss_quat
                 torch.save(model.state_dict(), os.path.join(args.save_dir, 'model_best.pt'))
-                print(f"  --> New best model saved! (Val Loss: {val_loss:.6f})")
+                print(
+                    f"  --> New best model saved! (Epoch: {best_epoch}, Val Loss: {val_loss:.6f}, "
+                    f"Pos: {best_val_pos:.6f}, Quat: {best_val_quat:.6f})"
+                )
                 
             # [修改] 不管是不是best，只要需要保存数据，每 20 个 epochs 强制存一次，用于动态观察动作
             if args.save_vis_data and ((epoch + 1) % 10 == 0 or epoch == args.epochs - 1):
@@ -535,7 +544,10 @@ def main():
     history_path = os.path.join(args.save_dir, 'train_history.npz')
     np.savez(history_path, **train_history)
     
-    print(f"\nTraining completed! Best validation loss: {best_val_loss:.6f}")
+    print(
+        f"\nTraining completed! Best validation loss: {best_val_loss:.6f} "
+        f"(Epoch: {best_epoch}, Pos: {best_val_pos:.6f}, Quat: {best_val_quat:.6f})"
+    )
     print(f"Training history saved to: {history_path}")
     
     # 训练结束后，使用你 utils 里的函数自动画 Loss Curve (保存为图片)
