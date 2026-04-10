@@ -296,25 +296,33 @@ class GroupedBatchSampler(Sampler):
         return count
 
 
-def process_stacking_data_dynamic(body_property, true_trajectories, velocity, angular_velocity, SEGMENTS):
+def process_stacking_data_dynamic(body_property, true_trajectories, velocity, angular_velocity, SEGMENTS, STRIDE=None):
     """
     适配动态物体数量的切分逻辑
     SEGMENTS: segment_len (片段长度),例如 15
     """
     bs, steps, n_obj, _ = body_property.shape
-    
-    # 计算能切分出多少个完整的片段
+
     segment_len = SEGMENTS
-    num_segments = steps // segment_len
-    
-    # 只取能整除的部分
-    effective_steps = num_segments * segment_len
+    stride = segment_len if STRIDE is None else STRIDE
+    if segment_len <= 0:
+        raise ValueError(f"segment_len must be positive, got {segment_len}")
+    if stride <= 0:
+        raise ValueError(f"stride must be positive, got {stride}")
+    if steps < segment_len:
+        raise ValueError(f"segment_len={segment_len} is larger than steps={steps}")
+
+    # 生成滑窗起点：默认 stride=segment_len 时与旧逻辑一致
+    start_indices = list(range(0, steps - segment_len + 1, stride))
+    if len(start_indices) == 0:
+        raise ValueError(
+            f"No valid segments for steps={steps}, segment_len={segment_len}, stride={stride}"
+        )
     
     def split_and_flatten(data):
-        d = data[:, :effective_steps]
-        d = d.reshape(bs, num_segments, segment_len, n_obj, -1)
-        d = d.reshape(bs * num_segments, segment_len, n_obj, -1)
-        return d
+        segments = [data[:, start:start + segment_len] for start in start_indices]
+        d = torch.stack(segments, dim=1)
+        return d.reshape(bs * len(start_indices), segment_len, n_obj, -1)
 
     body_prop_out = split_and_flatten(body_property)
     vel_out = split_and_flatten(velocity)

@@ -20,6 +20,70 @@ def quaternion_loss(pred_q, true_q):
     pred_q = torch.where(dot < 0, -pred_q, pred_q)
     return torch.mean((pred_q - true_q) ** 2)
 
+
+def parse_curriculum_schedule(curriculum_arg, epochs, default_segment_len):
+    """Parse preset or custom curriculum schedule into [(epoch_end, segment_len), ...]."""
+    preset_schedules = {
+        'default': [(50, 5), (150, 10), (300, 15), (epochs, 30)],
+        'aggressive': [(30, 5), (100, 10), (200, 15), (epochs, 30)],
+        'conservative': [(80, 5), (220, 10), (350, 15), (epochs, 30)],
+        'none': [(epochs, default_segment_len)],
+    }
+
+    if curriculum_arg in preset_schedules:
+        return preset_schedules[curriculum_arg]
+
+    schedule = []
+    for item in curriculum_arg.split(','):
+        item = item.strip()
+        if not item:
+            continue
+        if ':' not in item:
+            raise ValueError(
+                f"Invalid curriculum item '{item}'. Use 'epoch:segment' format."
+            )
+        epoch_str, seg_str = item.split(':', 1)
+        epoch_end = int(epoch_str.strip())
+        seg_len = int(seg_str.strip())
+        if epoch_end <= 0 or seg_len <= 0:
+            raise ValueError("Curriculum epoch and segment length must be positive.")
+        schedule.append((epoch_end, seg_len))
+
+    if not schedule:
+        raise ValueError(
+            "Curriculum is empty. Use preset (default/aggressive/conservative/none) "
+            "or custom format like '50:5,150:10,300:15,500:30'."
+        )
+
+    schedule.sort(key=lambda x: x[0])
+    if schedule[-1][0] < epochs:
+        schedule.append((epochs, schedule[-1][1]))
+    return schedule
+
+
+def build_optimizer(args, model):
+    if args.optimizer == 'adam':
+        return optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    if args.optimizer == 'adamw':
+        return optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    raise ValueError(f"Unsupported optimizer: {args.optimizer}")
+
+
+def build_scheduler(args, optimizer):
+    if args.scheduler == 'coswr':
+        return optim.lr_scheduler.CosineAnnealingWarmRestarts(
+            optimizer, T_0=100, T_mult=2, eta_min=args.eta_min
+        )
+    if args.scheduler == 'cosine':
+        return optim.lr_scheduler.CosineAnnealingLR(
+            optimizer, T_max=args.epochs, eta_min=args.eta_min
+        )
+    if args.scheduler == 'step':
+        return optim.lr_scheduler.StepLR(optimizer, step_size=100, gamma=0.1)
+    if args.scheduler == 'none':
+        return None
+    raise ValueError(f"Unsupported scheduler: {args.scheduler}")
+
 def get_args():
     parser = argparse.ArgumentParser()
     parser.add_argument('--data_path', type=str, default='/mnt/nfs_project_a/chang/small_data/data/blocktower', help='Path to the dataset folder containing .npy files')
@@ -34,11 +98,18 @@ def get_args():
     parser.add_argument('--hidden_dim', type=int, default=256)
     parser.add_argument('--layer_num', type=int, default=4)
     parser.add_argument('--segment_len', type=int, default=15, help='Number of simulation steps per segment, suggested 3-30 for training')
+    parser.add_argument('--segment_stride', type=int, default=0, help='Stride for segment slicing; <=0 means use segment_len (no overlap)')
     parser.add_argument('--step_size', type=float, default=1/400, help='step size of ode solver (smaller = more accurate integration)')
     parser.add_argument('--dist_boundary', type=float, default=0.02, help='Boundary of distance mask')
     parser.add_argument('--use_dist_mask', action='store_true', default=True)
     parser.add_argument('--use_dist_input', action='store_true', default=True)
     parser.add_argument('--use_adjoint', action='store_true', default=False, help='Use adjoint method for memory efficiency')
+    parser.add_argument('--optimizer', type=str, default='adam', choices=['adam', 'adamw'],
+                       help='Optimizer type')
+    parser.add_argument('--scheduler', type=str, default='coswr', choices=['coswr', 'cosine', 'step', 'none'],
+                       help='LR scheduler type')
+    parser.add_argument('--curriculum', type=str, default='default',
+                       help='Curriculum preset(default/aggressive/conservative/none) or custom "50:5,150:10,..."')
     parser.add_argument('--quat_loss_weight', type=float, default=0.1, help='Weight for quaternion/rotation loss relative to position loss')
     parser.add_argument('--scene_type', type=str, default='all', choices=['all', 'stable', 'unstable'], 
                        help='Filter dataset by scene type')
@@ -258,8 +329,8 @@ def main():
     train_loader = DataLoader(dataset, batch_size=1, shuffle=False, num_workers=0)
     val_loader = DataLoader(dataset, batch_size=1, shuffle=False, num_workers=0)
     
-    optimizer = optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
-    scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer, T_0=100, T_mult=2, eta_min=args.eta_min)
+    optimizer = build_optimizer(args, model)
+    scheduler = build_scheduler(args, optimizer)
     criterion = nn.MSELoss()
     
     print("Start Training...")
@@ -275,23 +346,27 @@ def main():
     
     # Curriculum learning: 渐进增加segment长度，减少rollout误差累积
     # (epoch_end, segment_len): 在epoch < epoch_end时使用该segment_len
-    curriculum_schedule = [
-        (50, 5),      # epoch 0-49:  先用极短片段，让模型学好单步预测
-        (150, 10),    # epoch 50-149: 逐渐增加到10帧
-        (300, 15),    # epoch 150-299: 标准片段长度
-        (args.epochs, 30),  # epoch 300+: 更长rollout，锻炼长程预测能力
-    ]
+    curriculum_schedule = parse_curriculum_schedule(
+        curriculum_arg=args.curriculum,
+        epochs=args.epochs,
+        default_segment_len=args.segment_len,
+    )
 
     for epoch in range(args.epochs):
         epoch_loss = 0
         start_time = time.time()
 
         current_segment_len = args.segment_len
+        current_segment_stride = args.segment_len if args.segment_stride <= 0 else args.segment_stride
         for seg_epoch, seg_len in curriculum_schedule:
             if epoch < seg_epoch:
                 current_segment_len = seg_len
+                if args.segment_stride <= 0:
+                    current_segment_stride = current_segment_len
                 break
-        print(f"Epoch {epoch+1}: Training with Segment Length = {current_segment_len}")
+        if args.segment_stride > 0:
+            current_segment_stride = min(current_segment_stride, current_segment_len)
+        print(f"Epoch {epoch+1}: Training with Segment Length = {current_segment_len}, Stride = {current_segment_stride}")
         
         # 训练阶段
         for batch_idx, (game_names, body_prop, vel, ang_vel, body_nums) in enumerate(train_loader):
@@ -319,7 +394,7 @@ def main():
             true_traj = body_prop[..., 0:7].clone()
             
             body_prop_s, vel_s, ang_vel_s, true_traj_s = process_stacking_data_dynamic(
-                body_prop, true_traj, vel, ang_vel, SEGMENTS=current_segment_len
+                body_prop, true_traj, vel, ang_vel, SEGMENTS=current_segment_len, STRIDE=current_segment_stride
             )
 
             # process_stacking_data_dynamic 会展平 batch 和 segments -> [Batch*Seg, Time, Obj, ...]
@@ -446,7 +521,8 @@ def main():
             print(f"Epoch [{epoch+1}/{args.epochs}] Train Loss: {avg_train_loss:.6f} | "
                   f"Time: {time_elapsed:.2f}s")
         
-        scheduler.step()
+        if scheduler is not None:
+            scheduler.step()
         
         # 定期保存checkpoint
         if (epoch + 1) % 10 == 0:

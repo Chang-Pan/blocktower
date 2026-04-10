@@ -11,3 +11,4 @@ trash_can/
 analysis_results/
 finetune/
 experimental_data/
+.claude/
