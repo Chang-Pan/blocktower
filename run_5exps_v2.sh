@@ -3,6 +3,7 @@
 # 改进：sign-aware quat loss, soft sigmoid masks, time-weighted pos loss
 # 用法: bash run_5exps_v2.sh
 # 对比: exps/*_v2/ vs exps/*/（同名去掉_v2就是第一轮对照组）
+# 说明: Quaternion实验会在训练结束后自动读取best epoch并生成可视化GIF
 
 set -e
 
@@ -40,6 +41,27 @@ python 1scene_posnormed_train.py \
     --weight_decay 1e-5 \
     --quat_loss_weight 0.1 \
     --seed 42
+
+JOB_LOG="exps/quat_baseline_v2/job.log"
+VAL_DIR="exps/quat_baseline_v2/validation_data"
+OUT_DIR="exps/quat_baseline_v2/animations"
+
+echo "[Post] Auto visualization for quat_baseline_v2..."
+BEST_EPOCH=$(grep -oE 'Training completed! Best validation loss: .*\(Epoch: [0-9]+' "$JOB_LOG" | tail -n 1 | sed -E 's/.*\(Epoch: ([0-9]+)$/\1/' || true)
+BEST_NPZ=""
+if [ -n "$BEST_EPOCH" ] && [ -f "$VAL_DIR/debug_vis_epoch${BEST_EPOCH}.npz" ]; then
+    BEST_NPZ="$VAL_DIR/debug_vis_epoch${BEST_EPOCH}.npz"
+else
+    BEST_NPZ=$(ls "$VAL_DIR"/debug_vis_epoch*.npz 2>/dev/null | sort -V | tail -n 1 || true)
+fi
+
+if [ -n "$BEST_NPZ" ] && [ -f "$BEST_NPZ" ]; then
+    echo "[Post] Use NPZ: $BEST_NPZ"
+    python visualize_animations.py --results_path "$BEST_NPZ" --output_dir "$OUT_DIR" --fps 25 || \
+        echo "[Post][WARN] Visualization failed for quat_baseline_v2"
+else
+    echo "[Post][WARN] No validation npz found under $VAL_DIR; skip visualization"
+fi
 
 echo "=== Exp 1v2 Done === $(date)"
 SBATCH_EOF
@@ -80,6 +102,27 @@ python euler_1scene_posnormed_train.py \
     --euler_loss_weight 0.1 \
     --seed 42
 
+JOB_LOG="exps/euler_baseline_v2/job.log"
+VAL_DIR="exps/euler_baseline_v2/validation_data"
+OUT_DIR="exps/euler_baseline_v2/animations"
+
+echo "[Post] Auto Euler visualization for euler_baseline_v2..."
+BEST_EPOCH=$(grep -oE 'Training completed! Best validation loss: .*\(Epoch: [0-9]+' "$JOB_LOG" | tail -n 1 | sed -E 's/.*\(Epoch: ([0-9]+)$/\1/' || true)
+BEST_NPZ=""
+if [ -n "$BEST_EPOCH" ] && [ -f "$VAL_DIR/debug_vis_epoch${BEST_EPOCH}.npz" ]; then
+    BEST_NPZ="$VAL_DIR/debug_vis_epoch${BEST_EPOCH}.npz"
+else
+    BEST_NPZ=$(ls "$VAL_DIR"/debug_vis_epoch*.npz 2>/dev/null | sort -V | tail -n 1 || true)
+fi
+
+if [ -n "$BEST_NPZ" ] && [ -f "$BEST_NPZ" ]; then
+    echo "[Post] Use NPZ: $BEST_NPZ"
+    python visualize_animations_euler.py --results_path "$BEST_NPZ" --output_dir "$OUT_DIR" --fps 25 || \
+        echo "[Post][WARN] Euler visualization failed for euler_baseline_v2"
+else
+    echo "[Post][WARN] No validation npz found under $VAL_DIR; skip Euler visualization"
+fi
+
 echo "=== Exp 2v2 Done === $(date)"
 SBATCH_EOF
 echo "[Submitted] Exp 2v2: euler_baseline_v2"
@@ -118,6 +161,27 @@ python 1scene_posnormed_train.py \
     --weight_decay 0 \
     --quat_loss_weight 0.1 \
     --seed 42
+
+JOB_LOG="exps/quat_optuna_v2/job.log"
+VAL_DIR="exps/quat_optuna_v2/validation_data"
+OUT_DIR="exps/quat_optuna_v2/animations"
+
+echo "[Post] Auto visualization for quat_optuna_v2..."
+BEST_EPOCH=$(grep -oE 'Training completed! Best validation loss: .*\(Epoch: [0-9]+' "$JOB_LOG" | tail -n 1 | sed -E 's/.*\(Epoch: ([0-9]+)$/\1/' || true)
+BEST_NPZ=""
+if [ -n "$BEST_EPOCH" ] && [ -f "$VAL_DIR/debug_vis_epoch${BEST_EPOCH}.npz" ]; then
+    BEST_NPZ="$VAL_DIR/debug_vis_epoch${BEST_EPOCH}.npz"
+else
+    BEST_NPZ=$(ls "$VAL_DIR"/debug_vis_epoch*.npz 2>/dev/null | sort -V | tail -n 1 || true)
+fi
+
+if [ -n "$BEST_NPZ" ] && [ -f "$BEST_NPZ" ]; then
+    echo "[Post] Use NPZ: $BEST_NPZ"
+    python visualize_animations.py --results_path "$BEST_NPZ" --output_dir "$OUT_DIR" --fps 25 || \
+        echo "[Post][WARN] Visualization failed for quat_optuna_v2"
+else
+    echo "[Post][WARN] No validation npz found under $VAL_DIR; skip visualization"
+fi
 
 echo "=== Exp 3v2 Done === $(date)"
 SBATCH_EOF
@@ -158,6 +222,27 @@ python 1scene_posnormed_train.py \
     --quat_loss_weight 0.05 \
     --seed 42
 
+JOB_LOG="exps/quat_aggr_v2/job.log"
+VAL_DIR="exps/quat_aggr_v2/validation_data"
+OUT_DIR="exps/quat_aggr_v2/animations"
+
+echo "[Post] Auto visualization for quat_aggr_v2..."
+BEST_EPOCH=$(grep -oE 'Training completed! Best validation loss: .*\(Epoch: [0-9]+' "$JOB_LOG" | tail -n 1 | sed -E 's/.*\(Epoch: ([0-9]+)$/\1/' || true)
+BEST_NPZ=""
+if [ -n "$BEST_EPOCH" ] && [ -f "$VAL_DIR/debug_vis_epoch${BEST_EPOCH}.npz" ]; then
+    BEST_NPZ="$VAL_DIR/debug_vis_epoch${BEST_EPOCH}.npz"
+else
+    BEST_NPZ=$(ls "$VAL_DIR"/debug_vis_epoch*.npz 2>/dev/null | sort -V | tail -n 1 || true)
+fi
+
+if [ -n "$BEST_NPZ" ] && [ -f "$BEST_NPZ" ]; then
+    echo "[Post] Use NPZ: $BEST_NPZ"
+    python visualize_animations.py --results_path "$BEST_NPZ" --output_dir "$OUT_DIR" --fps 25 || \
+        echo "[Post][WARN] Visualization failed for quat_aggr_v2"
+else
+    echo "[Post][WARN] No validation npz found under $VAL_DIR; skip visualization"
+fi
+
 echo "=== Exp 4v2 Done === $(date)"
 SBATCH_EOF
 echo "[Submitted] Exp 4v2: quat_aggr_v2"
@@ -196,6 +281,27 @@ python euler_1scene_posnormed_train.py \
     --weight_decay 0 \
     --euler_loss_weight 0.1 \
     --seed 42
+
+JOB_LOG="exps/euler_high_lr_v2/job.log"
+VAL_DIR="exps/euler_high_lr_v2/validation_data"
+OUT_DIR="exps/euler_high_lr_v2/animations"
+
+echo "[Post] Auto Euler visualization for euler_high_lr_v2..."
+BEST_EPOCH=$(grep -oE 'Training completed! Best validation loss: .*\(Epoch: [0-9]+' "$JOB_LOG" | tail -n 1 | sed -E 's/.*\(Epoch: ([0-9]+)$/\1/' || true)
+BEST_NPZ=""
+if [ -n "$BEST_EPOCH" ] && [ -f "$VAL_DIR/debug_vis_epoch${BEST_EPOCH}.npz" ]; then
+    BEST_NPZ="$VAL_DIR/debug_vis_epoch${BEST_EPOCH}.npz"
+else
+    BEST_NPZ=$(ls "$VAL_DIR"/debug_vis_epoch*.npz 2>/dev/null | sort -V | tail -n 1 || true)
+fi
+
+if [ -n "$BEST_NPZ" ] && [ -f "$BEST_NPZ" ]; then
+    echo "[Post] Use NPZ: $BEST_NPZ"
+    python visualize_animations_euler.py --results_path "$BEST_NPZ" --output_dir "$OUT_DIR" --fps 25 || \
+        echo "[Post][WARN] Euler visualization failed for euler_high_lr_v2"
+else
+    echo "[Post][WARN] No validation npz found under $VAL_DIR; skip Euler visualization"
+fi
 
 echo "=== Exp 5v2 Done === $(date)"
 SBATCH_EOF
@@ -244,6 +350,27 @@ python 1scene_posnormed_train.py \
     --segment_stride 5 \
     --seed 42
 
+JOB_LOG="exps/quat_overlap5_v2/job.log"
+VAL_DIR="exps/quat_overlap5_v2/validation_data"
+OUT_DIR="exps/quat_overlap5_v2/animations"
+
+echo "[Post] Auto visualization for quat_overlap5_v2..."
+BEST_EPOCH=$(grep -oE 'Training completed! Best validation loss: .*\(Epoch: [0-9]+' "$JOB_LOG" | tail -n 1 | sed -E 's/.*\(Epoch: ([0-9]+)$/\1/' || true)
+BEST_NPZ=""
+if [ -n "$BEST_EPOCH" ] && [ -f "$VAL_DIR/debug_vis_epoch${BEST_EPOCH}.npz" ]; then
+    BEST_NPZ="$VAL_DIR/debug_vis_epoch${BEST_EPOCH}.npz"
+else
+    BEST_NPZ=$(ls "$VAL_DIR"/debug_vis_epoch*.npz 2>/dev/null | sort -V | tail -n 1 || true)
+fi
+
+if [ -n "$BEST_NPZ" ] && [ -f "$BEST_NPZ" ]; then
+    echo "[Post] Use NPZ: $BEST_NPZ"
+    python visualize_animations.py --results_path "$BEST_NPZ" --output_dir "$OUT_DIR" --fps 25 || \
+        echo "[Post][WARN] Visualization failed for quat_overlap5_v2"
+else
+    echo "[Post][WARN] No validation npz found under $VAL_DIR; skip visualization"
+fi
+
 echo "=== Exp 6v2 Done === $(date)"
 SBATCH_EOF
 echo "[Submitted] Exp 6v2: quat_overlap5_v2"
@@ -283,6 +410,27 @@ python 1scene_posnormed_train.py \
     --quat_loss_weight 0.05 \
     --segment_stride 1 \
     --seed 42
+
+JOB_LOG="exps/quat_overlap1_v2/job.log"
+VAL_DIR="exps/quat_overlap1_v2/validation_data"
+OUT_DIR="exps/quat_overlap1_v2/animations"
+
+echo "[Post] Auto visualization for quat_overlap1_v2..."
+BEST_EPOCH=$(grep -oE 'Training completed! Best validation loss: .*\(Epoch: [0-9]+' "$JOB_LOG" | tail -n 1 | sed -E 's/.*\(Epoch: ([0-9]+)$/\1/' || true)
+BEST_NPZ=""
+if [ -n "$BEST_EPOCH" ] && [ -f "$VAL_DIR/debug_vis_epoch${BEST_EPOCH}.npz" ]; then
+    BEST_NPZ="$VAL_DIR/debug_vis_epoch${BEST_EPOCH}.npz"
+else
+    BEST_NPZ=$(ls "$VAL_DIR"/debug_vis_epoch*.npz 2>/dev/null | sort -V | tail -n 1 || true)
+fi
+
+if [ -n "$BEST_NPZ" ] && [ -f "$BEST_NPZ" ]; then
+    echo "[Post] Use NPZ: $BEST_NPZ"
+    python visualize_animations.py --results_path "$BEST_NPZ" --output_dir "$OUT_DIR" --fps 25 || \
+        echo "[Post][WARN] Visualization failed for quat_overlap1_v2"
+else
+    echo "[Post][WARN] No validation npz found under $VAL_DIR; skip visualization"
+fi
 
 echo "=== Exp 7v2 Done === $(date)"
 SBATCH_EOF
@@ -324,6 +472,27 @@ python euler_1scene_posnormed_train.py \
     --segment_stride 5 \
     --seed 42
 
+JOB_LOG="exps/euler_overlap5_v2/job.log"
+VAL_DIR="exps/euler_overlap5_v2/validation_data"
+OUT_DIR="exps/euler_overlap5_v2/animations"
+
+echo "[Post] Auto Euler visualization for euler_overlap5_v2..."
+BEST_EPOCH=$(grep -oE 'Training completed! Best validation loss: .*\(Epoch: [0-9]+' "$JOB_LOG" | tail -n 1 | sed -E 's/.*\(Epoch: ([0-9]+)$/\1/' || true)
+BEST_NPZ=""
+if [ -n "$BEST_EPOCH" ] && [ -f "$VAL_DIR/debug_vis_epoch${BEST_EPOCH}.npz" ]; then
+    BEST_NPZ="$VAL_DIR/debug_vis_epoch${BEST_EPOCH}.npz"
+else
+    BEST_NPZ=$(ls "$VAL_DIR"/debug_vis_epoch*.npz 2>/dev/null | sort -V | tail -n 1 || true)
+fi
+
+if [ -n "$BEST_NPZ" ] && [ -f "$BEST_NPZ" ]; then
+    echo "[Post] Use NPZ: $BEST_NPZ"
+    python visualize_animations_euler.py --results_path "$BEST_NPZ" --output_dir "$OUT_DIR" --fps 25 || \
+        echo "[Post][WARN] Euler visualization failed for euler_overlap5_v2"
+else
+    echo "[Post][WARN] No validation npz found under $VAL_DIR; skip Euler visualization"
+fi
+
 echo "=== Exp 8v2 Done === $(date)"
 SBATCH_EOF
 echo "[Submitted] Exp 8v2: euler_overlap5_v2"
@@ -363,6 +532,27 @@ python euler_1scene_posnormed_train.py \
     --euler_loss_weight 0.1 \
     --segment_stride 1 \
     --seed 42
+
+JOB_LOG="exps/euler_overlap1_v2/job.log"
+VAL_DIR="exps/euler_overlap1_v2/validation_data"
+OUT_DIR="exps/euler_overlap1_v2/animations"
+
+echo "[Post] Auto Euler visualization for euler_overlap1_v2..."
+BEST_EPOCH=$(grep -oE 'Training completed! Best validation loss: .*\(Epoch: [0-9]+' "$JOB_LOG" | tail -n 1 | sed -E 's/.*\(Epoch: ([0-9]+)$/\1/' || true)
+BEST_NPZ=""
+if [ -n "$BEST_EPOCH" ] && [ -f "$VAL_DIR/debug_vis_epoch${BEST_EPOCH}.npz" ]; then
+    BEST_NPZ="$VAL_DIR/debug_vis_epoch${BEST_EPOCH}.npz"
+else
+    BEST_NPZ=$(ls "$VAL_DIR"/debug_vis_epoch*.npz 2>/dev/null | sort -V | tail -n 1 || true)
+fi
+
+if [ -n "$BEST_NPZ" ] && [ -f "$BEST_NPZ" ]; then
+    echo "[Post] Use NPZ: $BEST_NPZ"
+    python visualize_animations_euler.py --results_path "$BEST_NPZ" --output_dir "$OUT_DIR" --fps 25 || \
+        echo "[Post][WARN] Euler visualization failed for euler_overlap1_v2"
+else
+    echo "[Post][WARN] No validation npz found under $VAL_DIR; skip Euler visualization"
+fi
 
 echo "=== Exp 9v2 Done === $(date)"
 SBATCH_EOF

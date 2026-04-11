@@ -114,7 +114,7 @@ def get_args():
     parser.add_argument('--scene_type', type=str, default='all', choices=['all', 'stable', 'unstable'], 
                        help='Filter dataset by scene type')
     parser.add_argument('--val_ratio', type=float, default=0.2, help='Validation set ratio')
-    parser.add_argument('--val_interval', type=int, default=5, help='Run validation every N epochs')
+    parser.add_argument('--val_interval', type=int, default=10, help='Run validation every N epochs')
     parser.add_argument('--save_vis_data', action='store_true', default=True, 
                        help='Save visualization data during validation')
     parser.add_argument('--vis_stable_scenes', type=int, default=3, 
