@@ -2,6 +2,7 @@ import torch
 import torch.optim as optim
 from torch.utils.data import DataLoader
 import torch.nn as nn
+import torch.nn.functional as F
 import os
 import time
 import numpy as np  
@@ -12,13 +13,45 @@ import importlib
 torch.autograd.set_detect_anomaly(True)
 
 from utils.blocktower_data_nff import DebugData, process_stacking_data_dynamic
-from utils.util import vis_losscurve
+from utils.util import vis_losscurve, vis_lrcurve
 
-def quaternion_loss(pred_q, true_q):
-    """Sign-aware quaternion MSE: q and -q represent the same rotation."""
-    dot = (pred_q * true_q).sum(dim=-1, keepdim=True)
-    pred_q = torch.where(dot < 0, -pred_q, pred_q)
-    return torch.mean((pred_q - true_q) ** 2)
+def _normalized_quaternion_dot(pred_q, true_q):
+    pred_q_n = F.normalize(pred_q, p=2, dim=-1, eps=1e-8)
+    true_q_n = F.normalize(true_q, p=2, dim=-1, eps=1e-8)
+    return (pred_q_n * true_q_n).sum(dim=-1, keepdim=True)
+
+
+def quaternion_loss(pred_q, true_q, loss_type='mse', arccos_eps=1e-7):
+    """Quaternion loss with selectable type: mse | stable | arccos."""
+    dot = _normalized_quaternion_dot(pred_q, true_q)
+
+    if loss_type == 'mse':
+        pred_q_aligned = torch.where(dot < 0, -pred_q, pred_q)
+        return torch.mean((pred_q_aligned - true_q) ** 2)
+
+    dot_abs = torch.abs(dot)
+    if loss_type == 'stable':
+        return torch.mean(1.0 - dot_abs)
+
+    if loss_type == 'arccos':
+        dot_abs = torch.clamp(dot_abs, min=0.0, max=1.0 - arccos_eps)
+        angle_rad = 2.0 * torch.acos(dot_abs)
+        return torch.mean(angle_rad ** 2)
+
+    raise ValueError(f"Unsupported quat_loss_type: {loss_type}")
+
+
+def quaternion_angle_error_deg_stats(pred_q, true_q):
+    """Return quaternion geodesic angle error stats in degrees (mean, p90, max)."""
+    dot = _normalized_quaternion_dot(pred_q, true_q)
+    dot_abs = torch.clamp(torch.abs(dot), min=0.0, max=1.0)
+    angle_deg = 2.0 * torch.acos(dot_abs) * (180.0 / torch.pi)
+    angle_deg_flat = angle_deg.reshape(-1)
+
+    mean_deg = torch.mean(angle_deg_flat)
+    p90_deg = torch.quantile(angle_deg_flat, 0.9)
+    max_deg = torch.max(angle_deg_flat)
+    return mean_deg, p90_deg, max_deg
 
 
 def parse_curriculum_schedule(curriculum_arg, epochs, default_segment_len):
@@ -110,7 +143,19 @@ def get_args():
                        help='LR scheduler type')
     parser.add_argument('--curriculum', type=str, default='default',
                        help='Curriculum preset(default/aggressive/conservative/none) or custom "50:5,150:10,..."')
-    parser.add_argument('--quat_loss_weight', type=float, default=0.1, help='Weight for quaternion/rotation loss relative to position loss')
+    parser.add_argument(
+        '--quat_loss_type',
+        type=str,
+        default='mse',
+        choices=['mse', 'stable', 'arccos'],
+        help='Quaternion loss type: mse(sign-aware) | stable(1-|dot|) | arccos((2*acos(|dot|))^2)'
+    )
+    parser.add_argument(
+        '--quat_loss_weight',
+        type=float,
+        default=0.1,
+        help='Weight for quaternion/rotation loss. Recommended candidates: mse={0.1,0.3,1.0}, stable={0.3,1.0,3.0}, arccos={0.01,0.03,0.1}'
+    )
     parser.add_argument('--scene_type', type=str, default='all', choices=['all', 'stable', 'unstable'], 
                        help='Filter dataset by scene type')
     parser.add_argument('--val_ratio', type=float, default=0.2, help='Validation set ratio')
@@ -136,12 +181,14 @@ def validate_epoch(model, val_loader, criterion, device, args, save_predictions=
         save_predictions: 是否保存预测结果用于可视化
     
     Returns:
-        val_loss, val_loss_pos, val_loss_quat, predictions (如果save_predictions=True)
+        val_loss, val_loss_pos, val_loss_quat, val_angle_mean, val_angle_p90, val_angle_max,
+        predictions (如果save_predictions=True)
     """
     model.eval()
     val_loss = 0
     val_loss_pos = 0
     val_loss_quat = 0
+    angle_error_all = []
     
     # 如果需要保存可视化数据,分别收集stable和unstable场景
     stable_scenes = [] if save_predictions else None
@@ -197,8 +244,17 @@ def validate_epoch(model, val_loader, criterion, device, args, save_predictions=
             true_quat = true_traj[..., 3:7]
 
             loss_pos = criterion(pred_pos, true_pos)
-            loss_quat = quaternion_loss(pred_quat, true_quat)
+            loss_quat = quaternion_loss(
+                pred_quat,
+                true_quat,
+                loss_type=args.quat_loss_type,
+            )
             loss = loss_pos + args.quat_loss_weight * loss_quat
+
+            batch_angle_deg = 2.0 * torch.acos(
+                torch.clamp(torch.abs(_normalized_quaternion_dot(pred_quat, true_quat)), min=0.0, max=1.0)
+            ) * (180.0 / torch.pi)
+            angle_error_all.append(batch_angle_deg.reshape(-1).cpu())
 
             val_loss += loss.item()
             val_loss_pos += loss_pos.item()
@@ -250,6 +306,15 @@ def validate_epoch(model, val_loader, criterion, device, args, save_predictions=
     val_loss /= num_batches
     val_loss_pos /= num_batches
     val_loss_quat /= num_batches
+    if len(angle_error_all) > 0:
+        all_angle = torch.cat(angle_error_all)
+        val_angle_mean = torch.mean(all_angle).item()
+        val_angle_p90 = torch.quantile(all_angle, 0.9).item()
+        val_angle_max = torch.max(all_angle).item()
+    else:
+        val_angle_mean = 0.0
+        val_angle_p90 = 0.0
+        val_angle_max = 0.0
     
     model.train()
     
@@ -259,9 +324,9 @@ def validate_epoch(model, val_loader, criterion, device, args, save_predictions=
             'stable_scenes': stable_scenes,
             'unstable_scenes': unstable_scenes
         }
-        return val_loss, val_loss_pos, val_loss_quat, predictions
+        return val_loss, val_loss_pos, val_loss_quat, val_angle_mean, val_angle_p90, val_angle_max, predictions
     else:
-        return val_loss, val_loss_pos, val_loss_quat
+        return val_loss, val_loss_pos, val_loss_quat, val_angle_mean, val_angle_p90, val_angle_max
 
 def main():
     args = get_args()
@@ -343,9 +408,18 @@ def main():
     best_epoch = -1
     best_val_pos = float('inf')
     best_val_quat = float('inf')
+    best_val_angle_mean = float('inf')
     
     # 记录训练历史
-    train_history = {'train_loss': [], 'val_loss': [], 'val_loss_pos': [], 'val_loss_quat': []}
+    train_history = {
+        'train_loss': [],
+        'val_loss': [],
+        'val_loss_pos': [],
+        'val_loss_quat': [],
+        'val_angle_mean_deg': [],
+        'val_angle_p90_deg': [],
+        'val_angle_max_deg': [],
+    }
     
     # Curriculum learning: 渐进增加segment长度，减少rollout误差累积
     # (epoch_end, segment_len): 在epoch < epoch_end时使用该segment_len
@@ -427,7 +501,11 @@ def main():
             n_steps = pred_pos.shape[1]
             time_w = torch.linspace(0.5, 1.5, n_steps, device=device).view(1, -1, 1, 1)
             loss_pos = torch.mean((pred_pos - true_pos) ** 2 * time_w)
-            loss_quat = quaternion_loss(pred_quat, true_quat)
+            loss_quat = quaternion_loss(
+                pred_quat,
+                true_quat,
+                loss_type=args.quat_loss_type,
+            )
             loss = loss_pos + args.quat_loss_weight * loss_quat
 
             loss.backward()
@@ -478,22 +556,27 @@ def main():
         # 验证阶段
         if (epoch + 1) % args.val_interval == 0 or epoch == args.epochs - 1:
             # 先运行验证计算损失
-            val_loss, val_loss_pos, val_loss_quat = validate_epoch(
+            val_loss, val_loss_pos, val_loss_quat, val_angle_mean, val_angle_p90, val_angle_max = validate_epoch(
                 model, val_loader, criterion, device, args, save_predictions=False
             )
             
             train_history['val_loss'].append(val_loss)
             train_history['val_loss_pos'].append(val_loss_pos)
             train_history['val_loss_quat'].append(val_loss_quat)
+            train_history['val_angle_mean_deg'].append(val_angle_mean)
+            train_history['val_angle_p90_deg'].append(val_angle_p90)
+            train_history['val_angle_max_deg'].append(val_angle_max)
             
             print(f"Epoch [{epoch+1}/{args.epochs}] Train Loss: {avg_train_loss:.6f} | "
                   f"Val Loss: {val_loss:.6f} (Pos: {val_loss_pos:.6f}, Quat: {val_loss_quat:.6f}) | "
+                  f"AngleDeg(mean/p90/max): {val_angle_mean:.3f}/{val_angle_p90:.3f}/{val_angle_max:.3f} | "
                   f"Time: {time_elapsed:.2f}s")
             
             logging.info(
                 f"[VAL] Epoch [{epoch+1}/{args.epochs}] Loss: {val_loss:.8f}, "
                 f"MSE: {val_loss_pos:.8f}, Residual Loss: {val_loss_quat:.8f}, "
-                f"Residual Residual Loss: 0.0"
+                f"Residual Residual Loss: 0.0, "
+                f"Angle Mean Deg: {val_angle_mean:.6f}, Angle P90 Deg: {val_angle_p90:.6f}, Angle Max Deg: {val_angle_max:.6f}"
             )
 
             # 保存最佳模型
@@ -502,17 +585,18 @@ def main():
                 best_epoch = epoch + 1
                 best_val_pos = val_loss_pos
                 best_val_quat = val_loss_quat
+                best_val_angle_mean = val_angle_mean
                 torch.save(model.state_dict(), os.path.join(args.save_dir, 'model_best.pt'))
                 print(
                     f"  --> New best model saved! (Epoch: {best_epoch}, Val Loss: {val_loss:.6f}, "
-                    f"Pos: {best_val_pos:.6f}, Quat: {best_val_quat:.6f})"
+                    f"Pos: {best_val_pos:.6f}, Quat: {best_val_quat:.6f}, AngleMeanDeg: {best_val_angle_mean:.3f})"
                 )
                 
             # [修改] 不管是不是best，只要需要保存数据，每 20 个 epochs 强制存一次，用于动态观察动作
             if args.save_vis_data and ((epoch + 1) % 10 == 0 or epoch == args.epochs - 1):
                 print(f"  --> Collecting visualization data...")
                 # 重新运行验证以收集可视化数据
-                _, _, _, predictions = validate_epoch(
+                _, _, _, _, _, _, predictions = validate_epoch(
                     model, val_loader, criterion, device, args, save_predictions=True
                 )
                 
@@ -529,6 +613,9 @@ def main():
         else:
             print(f"Epoch [{epoch+1}/{args.epochs}] Train Loss: {avg_train_loss:.6f} | "
                   f"Time: {time_elapsed:.2f}s")
+
+        current_lr = optimizer.param_groups[0]['lr']
+        logging.info(f"[LR] Epoch [{epoch+1}/{args.epochs}] LR: {current_lr:.10e}")
         
         if scheduler is not None:
             scheduler.step()
@@ -546,7 +633,7 @@ def main():
     
     print(
         f"\nTraining completed! Best validation loss: {best_val_loss:.6f} "
-        f"(Epoch: {best_epoch}, Pos: {best_val_pos:.6f}, Quat: {best_val_quat:.6f})"
+        f"(Epoch: {best_epoch}, Pos: {best_val_pos:.6f}, Quat: {best_val_quat:.6f}, AngleMeanDeg: {best_val_angle_mean:.3f})"
     )
     print(f"Training history saved to: {history_path}")
     
@@ -556,6 +643,11 @@ def main():
         vis_losscurve(steps=args.epochs, log_file=log_file_path)
     except Exception as e:
         print(f"Error drawing loss curve: {e}")
+
+    try:
+        vis_lrcurve(log_file=log_file_path)
+    except Exception as e:
+        print(f"Error drawing lr curve: {e}")
 
 if __name__ == "__main__":
     main()

@@ -5,6 +5,7 @@ import csv
 import pandas as pd
 import re
 import matplotlib.pyplot as plt
+import os
 
 def setup_seed(seed):
     torch.manual_seed(seed)
@@ -110,9 +111,95 @@ def vis_losscurve(steps, log_file, eps=1e-8):
 
     plt.tight_layout()
 
-    import os
     log_dir = os.path.dirname(log_file)
     output_file = os.path.join(log_dir, f'loss_curve_split_{steps}.png')
     print(f'Saving plot to {output_file}')
     plt.savefig(output_file)
     plt.close()
+
+
+def vis_lrcurve_from_values(lr_values, output_file, epochs=None, title='Learning Rate Curve'):
+    """
+    Plot learning rate curve from a list/array of LR values.
+
+    Args:
+        lr_values: list/np.ndarray of LR values
+        output_file: output image path
+        epochs: optional list/np.ndarray of epoch indices (1-based recommended)
+        title: figure title
+    """
+    if lr_values is None or len(lr_values) == 0:
+        print('No lr_values provided. Skip plotting.')
+        return
+
+    lr_values = np.array(lr_values, dtype=np.float64)
+    if epochs is None:
+        epochs = np.arange(1, len(lr_values) + 1)
+    else:
+        epochs = np.array(epochs, dtype=np.int64)
+
+    plt.figure(figsize=(10, 4))
+    plt.plot(epochs, lr_values, color='tab:green', linewidth=1.8)
+    plt.title(title)
+    plt.xlabel('Epoch')
+    plt.ylabel('Learning Rate')
+    plt.grid(True)
+    plt.tight_layout()
+
+    os.makedirs(os.path.dirname(output_file), exist_ok=True)
+    print(f'Saving LR curve to {output_file}')
+    plt.savefig(output_file)
+    plt.close()
+
+
+def vis_lrcurve(log_file, output_file=None):
+    """
+    Parse and plot learning rate curve from log file.
+
+    Supported line examples:
+    - [LR] Epoch [12/1000] LR: 0.000300
+    - Epoch [12/1000] ... LR: 3.0e-4
+    - lr=0.0003
+
+    Priority is epoch-aware matches; if no epoch is found, falls back to order index.
+    """
+    epoch_lr_pairs = []
+    lr_only = []
+
+    # Epoch-aware patterns
+    p1 = re.compile(r"Epoch\s*\[(\d+)\s*/\s*\d+\].*?LR\s*[:=]\s*([\d\.eE\-\+]+)", re.IGNORECASE)
+    p2 = re.compile(r"\[LR\]\s*Epoch\s*\[(\d+)\s*/\s*\d+\]\s*LR\s*[:=]\s*([\d\.eE\-\+]+)", re.IGNORECASE)
+    # LR-only pattern fallback
+    p3 = re.compile(r"\blr\b\s*[:=]\s*([\d\.eE\-\+]+)", re.IGNORECASE)
+
+    with open(log_file, 'r', encoding='utf-8') as f:
+        for line in f:
+            m = p1.search(line) or p2.search(line)
+            if m:
+                epoch_lr_pairs.append((int(m.group(1)), float(m.group(2))))
+                continue
+
+            m3 = p3.search(line)
+            if m3:
+                lr_only.append(float(m3.group(1)))
+
+    if len(epoch_lr_pairs) == 0 and len(lr_only) == 0:
+        print('No LR entries matched in log. Please add LR logging first.')
+        return
+
+    if output_file is None:
+        log_dir = os.path.dirname(log_file)
+        output_file = os.path.join(log_dir, 'lr_curve.png')
+
+    if len(epoch_lr_pairs) > 0:
+        # If duplicates exist for same epoch, keep the last one.
+        epoch_to_lr = {}
+        for ep, lr in epoch_lr_pairs:
+            epoch_to_lr[ep] = lr
+        epochs = sorted(epoch_to_lr.keys())
+        lrs = [epoch_to_lr[e] for e in epochs]
+        vis_lrcurve_from_values(lrs, output_file, epochs=epochs, title='Learning Rate Curve (from log epochs)')
+        return
+
+    # Fallback: no epoch info, plot by occurrence index.
+    vis_lrcurve_from_values(lr_only, output_file, title='Learning Rate Curve (from log order)')

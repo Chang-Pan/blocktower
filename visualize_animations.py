@@ -88,7 +88,8 @@ def visualize_comparison(pred_traj, true_traj, save_path, fps=25):
             quat = current_true[i, 3:7]
             size = current_true[i, 7:10]
             
-            if i == 0:  # 地面
+            is_static = current_true[i, 10] < 0.5
+            if is_static:  # 静态物体（通常是地面）
                 color = 'gray'
                 alpha = 0.3
             else:
@@ -123,7 +124,8 @@ def visualize_comparison(pred_traj, true_traj, save_path, fps=25):
             quat = current_pred[i, 3:7]
             size = current_pred[i, 7:10]
             
-            if i == 0:  # 地面
+            is_static = current_pred[i, 10] < 0.5
+            if is_static:  # 静态物体（通常是地面）
                 color = 'gray'
                 alpha = 0.3
             else:
@@ -203,7 +205,8 @@ def visualize_single_trajectory(traj_data, save_path, title="Trajectory", fps=25
             quat = current_frame[i, 3:7]
             size = current_frame[i, 7:10]
             
-            if i == 0:
+            is_static = current_frame[i, 10] < 0.5
+            if is_static:
                 color = 'gray'
                 alpha = 0.3
             else:

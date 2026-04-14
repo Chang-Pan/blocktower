@@ -9,6 +9,7 @@ import importlib
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import DataLoader
 
@@ -27,6 +28,32 @@ def set_seed(seed: int):
 
 def count_parameters(model):
     return sum(p.numel() for p in model.parameters() if p.requires_grad)
+
+
+def _normalized_quaternion_dot(pred_q, true_q):
+    pred_q_n = F.normalize(pred_q, p=2, dim=-1, eps=1e-8)
+    true_q_n = F.normalize(true_q, p=2, dim=-1, eps=1e-8)
+    return (pred_q_n * true_q_n).sum(dim=-1, keepdim=True)
+
+
+def quaternion_loss(pred_q, true_q, loss_type='mse', arccos_eps=1e-7):
+    """Quaternion loss with selectable type: mse | stable | arccos."""
+    dot = _normalized_quaternion_dot(pred_q, true_q)
+
+    if loss_type == 'mse':
+        pred_q_aligned = torch.where(dot < 0, -pred_q, pred_q)
+        return torch.mean((pred_q_aligned - true_q) ** 2)
+
+    dot_abs = torch.abs(dot)
+    if loss_type == 'stable':
+        return torch.mean(1.0 - dot_abs)
+
+    if loss_type == 'arccos':
+        dot_abs = torch.clamp(dot_abs, min=0.0, max=1.0 - arccos_eps)
+        angle_rad = 2.0 * torch.acos(dot_abs)
+        return torch.mean(angle_rad ** 2)
+
+    raise ValueError(f"Unsupported quat_loss_type: {loss_type}")
 
 
 def build_model(
@@ -101,7 +128,7 @@ def _has_nonfinite_param(model):
     return False
 
 @torch.no_grad()
-def validate_epoch(model, val_loader, criterion, device, trial=None, epoch=None):
+def validate_epoch(model, val_loader, criterion, device, args, trial=None, epoch=None):
     model.eval()
     val_loss = 0.0
     val_loss_pos = 0.0
@@ -145,8 +172,12 @@ def validate_epoch(model, val_loader, criterion, device, trial=None, epoch=None)
         true_quat = true_traj[..., 3:7]
 
         loss_pos = criterion(pred_pos, true_pos)
-        loss_quat = criterion(pred_quat, true_quat)
-        loss = loss_pos + loss_quat
+        loss_quat = quaternion_loss(
+            pred_quat,
+            true_quat,
+            loss_type=args.quat_loss_type,
+        )
+        loss = loss_pos + args.quat_loss_weight * loss_quat
 
         if (not _is_finite_tensor(loss_pos)) or (not _is_finite_tensor(loss_quat)) or (not _is_finite_tensor(loss)):
             if trial is not None and epoch is not None:
@@ -273,8 +304,12 @@ def run_one_trial(trial, args, device):
             true_quat = true_traj_s[..., 3:7]
 
             loss_pos = criterion(pred_pos, true_pos)
-            loss_quat = criterion(pred_quat, true_quat)
-            loss = loss_pos + loss_quat
+            loss_quat = quaternion_loss(
+                pred_quat,
+                true_quat,
+                loss_type=args.quat_loss_type,
+            )
+            loss = loss_pos + args.quat_loss_weight * loss_quat
 
             if (not _is_finite_tensor(loss_pos)) or (not _is_finite_tensor(loss_quat)) or (not _is_finite_tensor(loss)):
                 _raise_pruned_nonfinite(trial, "train_loss", epoch)
@@ -296,7 +331,7 @@ def run_one_trial(trial, args, device):
 
         if ((epoch + 1) % args.val_interval == 0) or (epoch == args.epochs - 1):
             val_loss, val_loss_pos, val_loss_quat = validate_epoch(
-                model, val_loader, criterion, device, trial=trial, epoch=epoch
+                model, val_loader, criterion, device, args, trial=trial, epoch=epoch
             )
             last_reported = val_loss
 
@@ -422,6 +457,19 @@ def parse_args():
     p.add_argument("--tune_weight_decay", action="store_true", default=False)
     p.add_argument("--wd_min", type=float, default=1e-7)
     p.add_argument("--wd_max", type=float, default=1e-4)
+    p.add_argument(
+        "--quat_loss_type",
+        type=str,
+        default="mse",
+        choices=["mse", "stable", "arccos"],
+        help="Quaternion loss type: mse(sign-aware) | stable(1-|dot|) | arccos((2*acos(|dot|))^2)",
+    )
+    p.add_argument(
+        "--quat_loss_weight",
+        type=float,
+        default=1.0,
+        help="Weight for quaternion/rotation loss. Recommended candidates: mse={0.1,0.3,1.0}, stable={0.3,1.0,3.0}, arccos={0.01,0.03,0.1}",
+    )
 
     # 新增：联合搜索空间
     p.add_argument("--hidden_dim_choices", type=int, nargs="+", default=[64, 128, 256])

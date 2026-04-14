@@ -428,7 +428,7 @@ class ODEFunc(nn.Module):
         # 1. 归一化四元数 (防止ODE积分过程中偏离单位长度)
         curr_quat = all_features[:, :, 3:7]
         quat_norm = torch.norm(curr_quat, dim=-1, keepdim=True)
-        # quat_norm = torch.clamp(quat_norm, min=1e-8)  # 防止除以零
+        quat_norm = torch.clamp(quat_norm, min=1e-8)  # 防止除以零
         curr_quat_normalized = curr_quat / quat_norm
         all_features = torch.cat([
             z[:, :, :3],
@@ -627,7 +627,7 @@ class NeuralODEModel(nn.Module):
         # 确保输出的四元数是归一化的
         quat = res[..., 3:7]  # [batch, time, obj, 4]
         quat_norm = torch.norm(quat, dim=-1, keepdim=True)
-        # quat_norm = torch.clamp(quat_norm, min=1e-8)
+        quat_norm = torch.clamp(quat_norm, min=1e-8)
         res = res.clone()
         res[..., 3:7] = quat / quat_norm
         return res
