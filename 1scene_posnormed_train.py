@@ -22,7 +22,7 @@ def _normalized_quaternion_dot(pred_q, true_q):
 
 
 def quaternion_loss(pred_q, true_q, loss_type='mse', arccos_eps=1e-7):
-    """Quaternion loss with selectable type: mse | stable | arccos."""
+    """Quaternion loss with selectable type: mse | stable | arccos | huber_angle | arccos_l1."""
     dot = _normalized_quaternion_dot(pred_q, true_q)
 
     if loss_type == 'mse':
@@ -37,6 +37,22 @@ def quaternion_loss(pred_q, true_q, loss_type='mse', arccos_eps=1e-7):
         dot_abs = torch.clamp(dot_abs, min=0.0, max=1.0 - arccos_eps)
         angle_rad = 2.0 * torch.acos(dot_abs)
         return torch.mean(angle_rad ** 2)
+
+    if loss_type == 'huber_angle':
+        dot_abs = torch.clamp(dot_abs, min=0.0, max=1.0 - arccos_eps)
+        angle = 2.0 * torch.acos(dot_abs)
+        delta = 0.2  # ~11.5 degrees: below this use L2, above use L1
+        loss = torch.where(
+            angle < delta,
+            0.5 * angle ** 2,
+            delta * (angle - 0.5 * delta)
+        )
+        return torch.mean(loss)
+
+    if loss_type == 'arccos_l1':
+        dot_abs = torch.clamp(dot_abs, min=0.0, max=1.0 - arccos_eps)
+        angle = 2.0 * torch.acos(dot_abs)
+        return torch.mean(angle)
 
     raise ValueError(f"Unsupported quat_loss_type: {loss_type}")
 
@@ -147,8 +163,8 @@ def get_args():
         '--quat_loss_type',
         type=str,
         default='mse',
-        choices=['mse', 'stable', 'arccos'],
-        help='Quaternion loss type: mse(sign-aware) | stable(1-|dot|) | arccos((2*acos(|dot|))^2)'
+        choices=['mse', 'stable', 'arccos', 'huber_angle', 'arccos_l1'],
+        help='Quaternion loss type: mse(sign-aware) | stable(1-|dot|) | arccos((2*acos(|dot|))^2) | huber_angle(Huber on angle, delta=0.2) | arccos_l1(mean angle)'
     )
     parser.add_argument(
         '--quat_loss_weight',
