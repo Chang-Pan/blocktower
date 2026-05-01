@@ -77,8 +77,9 @@ class ForceFieldPredictor(nn.Module):
         q: [..., 4] (x, y, z, w)
         v: [..., 3]
         """
-        # Normalize quaternion to prevent numerical drift
-        q = torch.nn.functional.normalize(q, p=2, dim=-1)
+        # Normalize quaternion to prevent numerical drift (with eps for grad safety)
+        q_norm = torch.sqrt(torch.sum(q ** 2, dim=-1, keepdim=True) + 1e-14)
+        q = q / q_norm
 
         q_vec = q[..., :3]
         q_scalar = q[..., 3:4]
@@ -124,7 +125,8 @@ class ForceFieldPredictor(nn.Module):
         # We only care about exterior distance for mask usually, but SDF includes interior (negative)
         # For force field masking, we mostly care about positive distance (separation)
         
-        dist_outside = torch.norm(torch.clamp(q, min=0.0), dim=-1, keepdim=True)
+        clamped = torch.clamp(q, min=0.0)
+        dist_outside = torch.sqrt(torch.sum(clamped ** 2, dim=-1, keepdim=True) + 1e-14)
         dist_inside = torch.clamp(torch.max(q, dim=-1, keepdim=True)[0], max=0.0)
         
         return dist_outside + dist_inside
