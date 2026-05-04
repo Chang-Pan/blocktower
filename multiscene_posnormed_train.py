@@ -10,8 +10,6 @@ import logging
 import argparse
 import importlib
 
-#torch.autograd.set_detect_anomaly(True)
-
 from utils.blocktower_data_nff import BlockTowerData, GroupedBatchSampler, process_stacking_data_dynamic
 from utils.util import vis_losscurve, vis_lrcurve
 
@@ -146,13 +144,13 @@ def get_args():
     parser.add_argument('--weight_decay', type=float, default=1e-5)
     parser.add_argument('--hidden_dim', type=int, default=256)
     parser.add_argument('--layer_num', type=int, default=4)
-    parser.add_argument('--segment_len', type=int, default=15, help='Number of simulation steps per segment')
+    parser.add_argument('--segment_len', type=int, default=15, help='Number of simulation steps per segment, suggested 3-30 for training')
     parser.add_argument('--segment_stride', type=int, default=0, help='Stride for segment slicing; <=0 means use segment_len (no overlap)')
     parser.add_argument('--step_size', type=float, default=1/400, help='step size of ode solver (smaller = more accurate integration)')
     parser.add_argument('--dist_boundary', type=float, default=0.02, help='Boundary of distance mask')
     parser.add_argument('--use_dist_mask', action='store_true', default=True)
     parser.add_argument('--use_dist_input', action='store_true', default=True)
-    parser.add_argument('--use_adjoint', action='store_true', default=False, help='Use adjoint method for memory efficiency')
+    parser.add_argument('--use_adjoint', action='store_true', default=True, help='Use adjoint method for memory efficiency')
     parser.add_argument('--optimizer', type=str, default='adam', choices=['adam', 'adamw'],
                        help='Optimizer type')
     parser.add_argument('--scheduler', type=str, default='coswr', choices=['coswr', 'cosine', 'step', 'none'],
@@ -171,6 +169,12 @@ def get_args():
         type=float,
         default=0.1,
         help='Weight for quaternion/rotation loss. Recommended candidates: mse={0.1,0.3,1.0}, stable={0.3,1.0,3.0}, arccos={0.01,0.03,0.1}'
+    )
+    parser.add_argument(
+        '--arccos_eps',
+        type=float,
+        default=1e-7,
+        help='Epsilon for acos clamp: dot_abs clamped to [0, 1-eps]. Larger eps = smaller max gradient. 1e-7(default) -> grad~7071, 1e-4 -> grad~100, 1e-2 -> grad~10'
     )
     parser.add_argument('--scene_type', type=str, default='all', choices=['all', 'stable', 'unstable'], 
                        help='Filter dataset by scene type')
@@ -226,7 +230,7 @@ def validate_epoch(model, val_loader, criterion, device, args, save_predictions=
             scale_view = scene_scale.view(-1, 1, 1, 1) # [batch, 1, 1, 1]
 
             # 备份原始数据用于 True Trajectory (在保存可视化时用到)
-            # 深拷贝一份以防被原地修改
+            # 注意: 深拷贝一份以防被原地修改
             true_traj_orig_full = torch.cat([body_prop, vel, ang_vel], dim=-1).clone() # [Batch, Time, Obj, 17]
 
             # 执行归一化 (克隆避免原地修改污染原数据集缓存)
@@ -263,6 +267,7 @@ def validate_epoch(model, val_loader, criterion, device, args, save_predictions=
                 pred_quat,
                 true_quat,
                 loss_type=args.quat_loss_type,
+                arccos_eps=args.arccos_eps,
             )
             loss = loss_pos + args.quat_loss_weight * loss_quat
 
@@ -410,8 +415,22 @@ def main():
     train_sampler = GroupedBatchSampler(train_dataset, batch_size=args.batch_size, shuffle=True)
     val_sampler = GroupedBatchSampler(val_dataset, batch_size=args.batch_size, shuffle=False)
 
-    train_loader = DataLoader(train_dataset, batch_sampler=train_sampler, num_workers=0)
-    val_loader = DataLoader(val_dataset, batch_sampler=val_sampler, num_workers=0)
+    num_workers=0
+    train_loader = DataLoader(train_dataset, batch_sampler=train_sampler, num_workers=num_workers)
+    val_loader = DataLoader(val_dataset, batch_sampler=val_sampler, num_workers=num_workers)
+
+    # 在 train_loader 创建之后、训练循环之前加这段
+    print("=== DataLoader sanity check ===")
+    print(f"Configured batch_size = {args.batch_size}")
+    for i, (game_names, body_prop, vel, ang_vel, body_nums) in enumerate(train_loader):
+        print(
+            f"Batch {i}: actual_batch_size={len(game_names)}, "
+            f"body_prop={body_prop.shape}, vel={vel.shape}, ang_vel={ang_vel.shape}, "
+            f"body_nums={body_nums}"
+        )
+        if i >= 5:
+            break
+    print("===============================")
 
     optimizer = build_optimizer(args, model)
     scheduler = build_scheduler(args, optimizer)
@@ -524,8 +543,40 @@ def main():
                 pred_quat,
                 true_quat,
                 loss_type=args.quat_loss_type,
+                arccos_eps=args.arccos_eps,
             )
             loss = loss_pos + args.quat_loss_weight * loss_quat
+
+            # NaN early stopping: 一旦检测到NaN立刻终止训练
+            if torch.isnan(loss) or torch.isinf(loss):
+                print(f"\n{'='*60}")
+                print(f"[FATAL] NaN/Inf detected in loss at Epoch {epoch+1}, Batch {batch_idx+1}")
+                print(f"  loss={loss.item()}, loss_pos={loss_pos.item()}, loss_quat={loss_quat.item()}")
+                print(f"  pred_pos has NaN: {torch.isnan(pred_pos).any().item()}")
+                print(f"  pred_quat has NaN: {torch.isnan(pred_quat).any().item()}")
+                print(f"  Training terminated early.")
+                print(f"  Best model so far: Epoch {best_epoch}, Val Loss {best_val_loss:.6f}")
+                print(f"{'='*60}")
+                                # 保存 NaN 之前的 history 记录和图片
+                try:
+                    # 获取日志路径
+                    log_file_path = os.path.join(args.save_dir, 'train.log')
+                    
+                    # 只要已经完成过至少 1 个 epoch，就可以画图
+                    if epoch > 0:
+                        vis_losscurve(steps=epoch, log_file=log_file_path)
+                        vis_lrcurve(log_file=log_file_path)
+                    
+                    # 顺便把已有的 train_history 保存下来，方便之后查看详细数值
+                    history_path = os.path.join(args.save_dir, 'train_history_nan_earlystop.npz')
+                    import numpy as np
+                    np.savez(history_path, **train_history)
+                    print(f"  Saved partial history to {history_path}")
+                except Exception as e:
+                    print(f"  Failed to draw partial curves or save history: {e}")
+
+                import sys
+                sys.exit(1)
 
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
