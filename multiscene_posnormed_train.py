@@ -561,9 +561,8 @@ def main():
                 print(f"  pred_quat has NaN: {torch.isnan(pred_quat).any().item()}")
                 # 毒性 batch 诊断
                 print(f"  --- Batch diagnostics ---")
-                print(f"  body_nums: {batch.get('body_nums', 'N/A')}")
-                print(f"  scene_type: {batch.get('scene_type', 'N/A')}")
-                print(f"  scene_id: {batch.get('scene_id', 'N/A')}")
+                print(f"  body_nums: {body_nums}")
+                print(f"  scene_names: {game_names}")                
                 print(f"  pred_pos range: [{pred_pos.min().item():.4f}, {pred_pos.max().item():.4f}]")
                 print(f"  pred_quat range: [{pred_quat.min().item():.4f}, {pred_quat.max().item():.4f}]")
                 if not torch.isnan(pred_pos).all():
