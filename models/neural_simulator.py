@@ -13,7 +13,7 @@ class ForceFieldPredictor(nn.Module):
     Input: Initial feature and current position of objects
     Output: Predicted force vector
     """
-    def __init__(self, hidden_dim, output_layer, use_dist_mask=True, dist_boundary=0, use_dist_input=True, dist_input_scale=1e2, angle_scale=1e2):
+    def __init__(self, hidden_dim, output_layer, use_dist_mask=True, dist_boundary=0, use_dist_input=True, dist_input_scale=1e2, angle_scale=1e2, force_tanh=False):
         super(ForceFieldPredictor, self).__init__()# 1. 调用父类 PyTorch Module 的初始化
         # 2. 保存传入的配置参数到 self，供 forward 函数使用
         self.use_dist_mask = use_dist_mask
@@ -21,6 +21,7 @@ class ForceFieldPredictor(nn.Module):
         self.dist_input_scale = dist_input_scale
         self.angle_scale = angle_scale
         self.dist_boundary = dist_boundary
+        self.force_tanh = force_tanh
                 
         # Debug counter
         self.debug_counter = 0
@@ -58,18 +59,26 @@ class ForceFieldPredictor(nn.Module):
         # 7. 构建最终输出层
         # 输入是 branch 和 trunk 的逐元素乘积 (hidden_dim)，输出是力 (6维: Fx, Fy, Fz, Tx, Ty, Tz)
         self.output_layer = nn.Linear(hidden_dim,6)
+        # 力场输出有界化: tanh * learnable scale，防止ODE积分发散
+        if self.force_tanh:
+            self.force_scale = nn.Parameter(torch.ones(6) * 10.0)  # 初始最大力=10
 
         # P.s: 如果需要单独建模地面对积木块的力，在这里单独加一个网络
         # 输入是物体的所有几何特征 + 速度 + 角速度，输出是地面力的大小和方向
         # 8(去除了x和y，因为地面应该具有平移不变性)+3+3 = 14维
         ground_input_dim = 8 + 3 + 3
-        self.ground_mlp = nn.Sequential(
+        ground_layers = [
             nn.Linear(ground_input_dim, hidden_dim),
             nn.ReLU(),
             nn.Linear(hidden_dim, hidden_dim),
             nn.ReLU(),
-            nn.Linear(hidden_dim, 6)
-        )
+            nn.Linear(hidden_dim, 6),
+        ]
+        if self.force_tanh:
+            ground_layers.append(nn.Tanh())
+        self.ground_mlp = nn.Sequential(*ground_layers)
+        if self.force_tanh:
+            self.ground_force_scale = nn.Parameter(torch.ones(6) * 10.0)
     
     def quat_rotate(self, q, v):
         """
@@ -324,6 +333,8 @@ class ForceFieldPredictor(nn.Module):
         
         # force_flat = self.output_layer(nn.ReLU()(branch_output * trunk_output))
         force_flat = self.output_layer(branch_output * trunk_output)
+        if self.force_tanh:
+            force_flat = torch.tanh(force_flat) * self.force_scale
         force = force_flat.reshape(batch_size, obj_num, target_obj_num, 6)  # [batch, obj_num, target_obj_num, 6]
 
         if dist_mask is not None:
@@ -351,7 +362,9 @@ class ForceFieldPredictor(nn.Module):
         
         ground_input = torch.cat([ground_feat_input, ground_vel_input, ground_ang_vel_input], dim=-1)
         
-        ground_force = self.ground_mlp(ground_input) # [batch, target_obj_num, 6]
+        ground_force = self.ground_mlp(ground_input)  # [batch, target_obj_num, 6]
+        if self.force_tanh:
+            ground_force = ground_force * self.ground_force_scale
         
         # soft mask: 接近地面的物体受地面力，sigmoid平滑过渡
         ground_threshold = 1.0  # 真实空间阈值(米)

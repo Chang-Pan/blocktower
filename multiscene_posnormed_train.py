@@ -6,6 +6,7 @@ import torch.nn.functional as F
 import os
 import time
 import numpy as np  
+import sys
 import logging
 import argparse
 import importlib
@@ -176,6 +177,9 @@ def get_args():
         default=1e-7,
         help='Epsilon for acos clamp: dot_abs clamped to [0, 1-eps]. Larger eps = smaller max gradient. 1e-7(default) -> grad~7071, 1e-4 -> grad~100, 1e-2 -> grad~10'
     )
+    parser.add_argument('--grad_clip', type=float, default=1.0, help='Max norm for gradient clipping')
+    parser.add_argument('--force_tanh', action='store_true', default=False,
+                       help='Bound force output with tanh * learnable scale (prevents ODE divergence)')
     parser.add_argument('--scene_type', type=str, default='all', choices=['all', 'stable', 'unstable'], 
                        help='Filter dataset by scene type')
     parser.add_argument('--val_ratio', type=float, default=0.2, help='Validation set ratio')
@@ -390,7 +394,8 @@ def main():
         output_layer=args.layer_num, 
         use_dist_mask=args.use_dist_mask,
         use_dist_input=args.use_dist_input,
-        dist_boundary=args.dist_boundary
+        dist_boundary=args.dist_boundary,
+        force_tanh=args.force_tanh
     )
     ode_func = ODEFunc(force_predictor, mass=1.0)
     model = NeuralODEModel(ode_func, use_adjoint=args.use_adjoint, step_size=args.step_size)
@@ -554,6 +559,15 @@ def main():
                 print(f"  loss={loss.item()}, loss_pos={loss_pos.item()}, loss_quat={loss_quat.item()}")
                 print(f"  pred_pos has NaN: {torch.isnan(pred_pos).any().item()}")
                 print(f"  pred_quat has NaN: {torch.isnan(pred_quat).any().item()}")
+                # 毒性 batch 诊断
+                print(f"  --- Batch diagnostics ---")
+                print(f"  body_nums: {batch.get('body_nums', 'N/A')}")
+                print(f"  scene_type: {batch.get('scene_type', 'N/A')}")
+                print(f"  scene_id: {batch.get('scene_id', 'N/A')}")
+                print(f"  pred_pos range: [{pred_pos.min().item():.4f}, {pred_pos.max().item():.4f}]")
+                print(f"  pred_quat range: [{pred_quat.min().item():.4f}, {pred_quat.max().item():.4f}]")
+                if not torch.isnan(pred_pos).all():
+                    print(f"  pred_pos abs max: {pred_pos[~torch.isnan(pred_pos)].abs().max().item():.4f}")
                 print(f"  Training terminated early.")
                 print(f"  Best model so far: Epoch {best_epoch}, Val Loss {best_val_loss:.6f}")
                 print(f"{'='*60}")
@@ -569,17 +583,15 @@ def main():
                     
                     # 顺便把已有的 train_history 保存下来，方便之后查看详细数值
                     history_path = os.path.join(args.save_dir, 'train_history_nan_earlystop.npz')
-                    import numpy as np
                     np.savez(history_path, **train_history)
                     print(f"  Saved partial history to {history_path}")
                 except Exception as e:
                     print(f"  Failed to draw partial curves or save history: {e}")
 
-                import sys
                 sys.exit(1)
 
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
             if batch_idx == 0 and (epoch + 1) % 5 == 0:
                 fp = model.ode_func.force_predictor
 
