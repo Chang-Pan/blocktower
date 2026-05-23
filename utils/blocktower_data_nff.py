@@ -8,17 +8,22 @@ from collections import defaultdict
 FEATURE_DIM = 11 
 
 class BlockTowerData(Dataset):
-    def __init__(self, data_path, max_len=150, scene_type='all'):
+    def __init__(self, data_path, max_len=150, scene_type='all', min_blocks=None, max_blocks=None):
         """
         data_path: 文件夹路径
         max_len: 序列最大帧数
         scene_type: 'all' | 'stable' | 'unstable'
+        min_blocks: 最小积木数 (含); None 表示不限
+        max_blocks: 最大积木数 (含); None 表示不限
         """
         self.data_path = data_path
         self.max_len = max_len
         self.scene_type = scene_type
+        self.min_blocks = min_blocks
+        self.max_blocks = max_blocks
         
-        print(f"[BlockTowerData] Initialized with scene_type='{scene_type}'")
+        print(f"[BlockTowerData] Initialized with scene_type='{scene_type}', "
+              f"min_blocks={min_blocks}, max_blocks={max_blocks}")
 
         all_file_paths = glob.glob(os.path.join(data_path, "*.npy"))
         if len(all_file_paths) == 0:
@@ -47,6 +52,12 @@ class BlockTowerData(Dataset):
                 # 样例: dark_gray_17_stable_0.npy -> ['dark', 'gray', '17', 'stable', '0.npy']
                 parts = filename.split('_')
                 block_cnt = int(parts[2])
+
+                # --- 块数范围过滤 ---
+                if self.min_blocks is not None and block_cnt < self.min_blocks:
+                    continue
+                if self.max_blocks is not None and block_cnt > self.max_blocks:
+                    continue
                 
                 # 物体数量 = 积木数 + 1 (地面)
                 obj_num = block_cnt 

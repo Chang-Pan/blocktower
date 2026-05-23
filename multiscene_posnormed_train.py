@@ -145,6 +145,11 @@ def get_args():
     parser.add_argument('--weight_decay', type=float, default=1e-5)
     parser.add_argument('--hidden_dim', type=int, default=256)
     parser.add_argument('--layer_num', type=int, default=4)
+    # SlotFormer-specific args (ignored by neural_simulator)
+    parser.add_argument('--history_len', type=int, default=1, help='[SlotFormer] burn-in frames')
+    parser.add_argument('--num_heads', type=int, default=8, help='[SlotFormer] transformer attention heads')
+    parser.add_argument('--ffn_dim', type=int, default=512, help='[SlotFormer] transformer feedforward dim')
+    parser.add_argument('--slotres_scale', type=float, default=1e2, help='[SlotFormer] residual scale; larger = smaller per-step state change')
     parser.add_argument('--segment_len', type=int, default=15, help='Number of simulation steps per segment, suggested 3-30 for training')
     parser.add_argument('--segment_stride', type=int, default=0, help='Stride for segment slicing; <=0 means use segment_len (no overlap)')
     parser.add_argument('--step_size', type=float, default=1/400, help='step size of ode solver (smaller = more accurate integration)')
@@ -182,6 +187,8 @@ def get_args():
                        help='Bound force output with tanh * learnable scale (prevents ODE divergence)')
     parser.add_argument('--scene_type', type=str, default='all', choices=['all', 'stable', 'unstable'], 
                        help='Filter dataset by scene type')
+    parser.add_argument('--min_blocks', type=int, default=None, help='Min block count (inclusive); None = no limit')
+    parser.add_argument('--max_blocks', type=int, default=None, help='Max block count (inclusive); None = no limit. e.g. --max_blocks 5 for 1-5 block subset')
     parser.add_argument('--val_ratio', type=float, default=0.2, help='Validation set ratio')
     parser.add_argument('--val_interval', type=int, default=10, help='Run validation every N epochs')
     parser.add_argument('--save_vis_data', action='store_true', default=True, 
@@ -385,21 +392,37 @@ def main():
 
     print(f"Loaded model module: {model_module.__name__}")    
 
-    ForceFieldPredictor = model_module.ForceFieldPredictor
-    ODEFunc = model_module.ODEFunc
-    NeuralODEModel = model_module.NeuralODEModel
-    
-    force_predictor = ForceFieldPredictor(
-        hidden_dim=args.hidden_dim, 
-        output_layer=args.layer_num, 
-        use_dist_mask=args.use_dist_mask,
-        use_dist_input=args.use_dist_input,
-        dist_boundary=args.dist_boundary,
-        force_tanh=args.force_tanh
-    )
-    ode_func = ODEFunc(force_predictor, mass=1.0)
-    model = NeuralODEModel(ode_func, use_adjoint=args.use_adjoint, step_size=args.step_size)
-    model.to(device)
+    module_short_name = model_module.__name__.split(".")[-1]
+    if "slotformer" in module_short_name:
+        # Transformer-based dynamics model (no ODE integration -> no divergence NaN)
+        model = model_module.DynamicsSlotFormer(
+            slot_size=17,
+            history_len=args.history_len,
+            d_model=args.hidden_dim,
+            num_layers=args.layer_num,
+            num_heads=args.num_heads,
+            ffn_dim=args.ffn_dim,
+            norm_first=True,
+            slotres_scale=args.slotres_scale,
+        )
+        model.to(device)
+    else:
+        # Neural ODE force-field model
+        ForceFieldPredictor = model_module.ForceFieldPredictor
+        ODEFunc = model_module.ODEFunc
+        NeuralODEModel = model_module.NeuralODEModel
+
+        force_predictor = ForceFieldPredictor(
+            hidden_dim=args.hidden_dim, 
+            output_layer=args.layer_num, 
+            use_dist_mask=args.use_dist_mask,
+            use_dist_input=args.use_dist_input,
+            dist_boundary=args.dist_boundary,
+            force_tanh=args.force_tanh
+        )
+        ode_func = ODEFunc(force_predictor, mass=1.0)
+        model = NeuralODEModel(ode_func, use_adjoint=args.use_adjoint, step_size=args.step_size)
+        model.to(device)
 
     print("Model initialized successfully.")
     print(f"Total trainable parameters: {count_parameters(model)}")
@@ -409,7 +432,8 @@ def main():
     
     # 2. 数据加载和划分
     print(f"Loading Dataset ({args.scene_type})...")
-    dataset = BlockTowerData(data_path=args.data_path, max_len=150, scene_type=args.scene_type)
+    dataset = BlockTowerData(data_path=args.data_path, max_len=150, scene_type=args.scene_type,
+                             min_blocks=args.min_blocks, max_blocks=args.max_blocks)
 
     # 划分训练集和验证集 (按 stable/unstable 分层)
     train_dataset, val_dataset, val_stable_indices, val_unstable_indices = dataset.split_train_val(
@@ -591,7 +615,7 @@ def main():
 
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
-            if batch_idx == 0 and (epoch + 1) % 5 == 0:
+            if batch_idx == 0 and (epoch + 1) % 5 == 0 and hasattr(model, 'ode_func'):
                 fp = model.ode_func.force_predictor
 
                 b_grad = fp.branch_net[0].weight.grad
