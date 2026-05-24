@@ -118,19 +118,41 @@ def build_optimizer(args, model):
 
 
 def build_scheduler(args, optimizer):
+    # 构建主调度器
     if args.scheduler == 'coswr':
-        return optim.lr_scheduler.CosineAnnealingWarmRestarts(
+        main_sched = optim.lr_scheduler.CosineAnnealingWarmRestarts(
             optimizer, T_0=100, T_mult=2, eta_min=args.eta_min
         )
-    if args.scheduler == 'cosine':
-        return optim.lr_scheduler.CosineAnnealingLR(
-            optimizer, T_max=args.epochs, eta_min=args.eta_min
+    elif args.scheduler == 'cosine':
+        # 若有 warmup, cosine 的 T_max 应为剩余 epoch
+        t_max = args.epochs - args.warmup_epochs if args.warmup_epochs > 0 else args.epochs
+        main_sched = optim.lr_scheduler.CosineAnnealingLR(
+            optimizer, T_max=t_max, eta_min=args.eta_min
         )
-    if args.scheduler == 'step':
-        return optim.lr_scheduler.StepLR(optimizer, step_size=100, gamma=0.1)
-    if args.scheduler == 'none':
-        return None
-    raise ValueError(f"Unsupported scheduler: {args.scheduler}")
+    elif args.scheduler == 'step':
+        main_sched = optim.lr_scheduler.StepLR(optimizer, step_size=100, gamma=0.1)
+    elif args.scheduler == 'none':
+        main_sched = None
+    else:
+        raise ValueError(f"Unsupported scheduler: {args.scheduler}")
+
+    # warmup: 前 warmup_epochs 个 epoch 线性从 lr*warmup_start_factor 爬到 lr
+    if args.warmup_epochs > 0:
+        warmup_sched = optim.lr_scheduler.LinearLR(
+            optimizer,
+            start_factor=args.warmup_start_factor,
+            end_factor=1.0,
+            total_iters=args.warmup_epochs,
+        )
+        if main_sched is None:
+            return warmup_sched
+        return optim.lr_scheduler.SequentialLR(
+            optimizer,
+            schedulers=[warmup_sched, main_sched],
+            milestones=[args.warmup_epochs],
+        )
+
+    return main_sched
 
 def get_args():
     parser = argparse.ArgumentParser()
@@ -161,6 +183,10 @@ def get_args():
                        help='Optimizer type')
     parser.add_argument('--scheduler', type=str, default='coswr', choices=['coswr', 'cosine', 'step', 'none'],
                        help='LR scheduler type')
+    parser.add_argument('--warmup_epochs', type=int, default=0,
+                       help='Linear warmup epochs before main scheduler (0 = no warmup)')
+    parser.add_argument('--warmup_start_factor', type=float, default=0.01,
+                       help='Warmup starts at lr * this factor, linearly ramps to lr')
     parser.add_argument('--curriculum', type=str, default='default',
                        help='Curriculum preset(default/aggressive/conservative/none) or custom "50:5,150:10,..."')
     parser.add_argument(
