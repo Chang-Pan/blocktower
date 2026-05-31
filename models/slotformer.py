@@ -174,28 +174,41 @@ class DynamicsSlotFormer(nn.Module):
             slotres_scale=slotres_scale,
         )
 
-    def forward(self, z0, t, scene_scale=None):
+    def forward(self, z0, t, scene_scale=None, history=None):
         """
         Args:
-            z0: [B, num_slots, STATE_DIM] 初始状态 (第0帧)
+            z0: [B, num_slots, STATE_DIM] 第0帧状态 (history=None 时用它复制出 burn-in)
             t:  [B, timesteps] 时间索引 (与 NFF 接口一致, 仅用 shape 取 timesteps)
             scene_scale: 收下以对齐接口, SlotFormer 内部不使用 (输入已归一化)
+            history: [B, history_len, num_slots, STATE_DIM] 真实 burn-in 帧。
+                     提供时优先使用 (真正的时序上下文); 为 None 时回退到复制 z0
+                     (退化为单帧上下文, 仅用于自测/无历史的调用方)。
 
         Returns:
             [B, timesteps, num_slots, STATE_DIM]
+            前 history_len 帧为输入的 burn-in 帧 (原样返回), 其后为自回归预测帧。
         """
         timesteps = t.shape[1]
+        H = self.history_len
 
-        # burn-in: 用第0帧重复 history_len 次
-        burn_in = z0.unsqueeze(1).repeat(1, self.history_len, 1, 1)  # [B, H, N, D]
+        if history is not None:
+            assert history.shape[1] == H, \
+                f'expected history {H} frames, got {history.shape[1]}'
+            burn_in = history
+        else:
+            # 无真实历史: 用第0帧重复 history_len 次 (退化为单帧上下文)
+            burn_in = z0.unsqueeze(1).repeat(1, H, 1, 1)  # [B, H, N, D]
 
-        pred_len = timesteps - 1
+        assert timesteps >= H, \
+            f'timesteps ({timesteps}) must be >= history_len ({H})'
+
+        pred_len = timesteps - H
         if pred_len > 0:
             pred_slots = self.rollouter(burn_in, pred_len)  # [B, pred_len, N, D]
-            # 第0帧 (burn-in 最后一帧) + 预测帧
-            traj = torch.cat([burn_in[:, -1:], pred_slots], dim=1)
+            # burn-in 帧 (真实/复制) + 预测帧, 总长 = timesteps
+            traj = torch.cat([burn_in, pred_slots], dim=1)
         else:
-            traj = burn_in[:, -1:]
+            traj = burn_in[:, :timesteps]
 
         return traj  # [B, timesteps, N, STATE_DIM]
 
@@ -223,3 +236,17 @@ if __name__ == "__main__":
     tb = torch.linspace(0, 5, 100).unsqueeze(0).repeat(2, 1)
     outb = model(z0b, tb)
     print('dynamic num_slots output:', outb.shape)  # [2, 100, 10, 17]
+
+    # 测试真实多帧 burn-in (history_len > 1)
+    H = 6
+    model_h = DynamicsSlotFormer(
+        slot_size=STATE_DIM, history_len=H,
+        d_model=128, num_layers=4, num_heads=8, ffn_dim=512,
+        slotres_scale=1e2,
+    )
+    hist = torch.randn(B, H, N, STATE_DIM)
+    hist[..., 3:7] = hist[..., 3:7] / hist[..., 3:7].norm(dim=-1, keepdim=True)
+    out_h = model_h(hist[:, 0], t, history=hist)  # z0 仅占位, 实际用 history
+    print('history burn-in output:', out_h.shape)  # [4, 150, 6, 17]
+    # 前 H 帧应原样等于输入的 burn-in
+    print('burn-in preserved:', torch.allclose(out_h[:, :H], hist, atol=1e-6))

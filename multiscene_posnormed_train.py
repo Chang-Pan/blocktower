@@ -71,10 +71,11 @@ def quaternion_angle_error_deg_stats(pred_q, true_q):
 
 def parse_curriculum_schedule(curriculum_arg, epochs, default_segment_len):
     """Parse preset or custom curriculum schedule into [(epoch_end, segment_len), ...]."""
+    # 最短段为 8: 兼容 SlotFormer 默认 burn-in (history_len 最大可设到 7)。
     preset_schedules = {
-        'default': [(50, 5), (150, 10), (300, 15), (epochs, 30)],
-        'aggressive': [(30, 5), (100, 10), (200, 15), (epochs, 30)],
-        'conservative': [(80, 5), (220, 10), (350, 15), (epochs, 30)],
+        'default': [(50, 8), (150, 12), (300, 18), (epochs, 30)],
+        'aggressive': [(30, 8), (100, 12), (200, 18), (epochs, 30)],
+        'conservative': [(80, 8), (220, 12), (350, 18), (epochs, 30)],
         'none': [(epochs, default_segment_len)],
     }
 
@@ -168,7 +169,9 @@ def get_args():
     parser.add_argument('--hidden_dim', type=int, default=256)
     parser.add_argument('--layer_num', type=int, default=4)
     # SlotFormer-specific args (ignored by neural_simulator)
-    parser.add_argument('--history_len', type=int, default=1, help='[SlotFormer] burn-in frames')
+    parser.add_argument('--history_len', type=int, default=1,
+                       help='[SlotFormer] real burn-in frames fed to the transformer. Must be < every '
+                            'curriculum segment_len (default preset min=8, so up to 7). Original SlotFormer uses 6.')
     parser.add_argument('--num_heads', type=int, default=8, help='[SlotFormer] transformer attention heads')
     parser.add_argument('--ffn_dim', type=int, default=512, help='[SlotFormer] transformer feedforward dim')
     parser.add_argument('--slotres_scale', type=float, default=1e2, help='[SlotFormer] residual scale; larger = smaller per-step state change')
@@ -188,7 +191,10 @@ def get_args():
     parser.add_argument('--warmup_start_factor', type=float, default=0.01,
                        help='Warmup starts at lr * this factor, linearly ramps to lr')
     parser.add_argument('--curriculum', type=str, default='default',
-                       help='Curriculum preset(default/aggressive/conservative/none) or custom "50:5,150:10,..."')
+                       help='Curriculum preset or custom "8:8,150:12,...". Presets start at segment_len=8 '
+                            '(default: 8/12/18/30, aggressive/conservative shift epoch boundaries). '
+                            'For SlotFormer every segment_len must be > --history_len; if you raise '
+                            'history_len use a custom schedule with a larger first segment.')
     parser.add_argument(
         '--quat_loss_type',
         type=str,
@@ -229,7 +235,7 @@ def get_args():
 def count_parameters(model):
     return sum(p.numel() for p in model.parameters() if p.requires_grad)
 
-def validate_epoch(model, val_loader, criterion, device, args, save_predictions=False):
+def validate_epoch(model, val_loader, criterion, device, args, save_predictions=False, is_slotformer=False):
     """
     在验证集上运行一个epoch
     
@@ -290,9 +296,15 @@ def validate_epoch(model, val_loader, criterion, device, args, save_predictions=
             
             sim_steps = true_traj.shape[1] # 150
             t = torch.linspace(0, (sim_steps-1)/25.0, steps=sim_steps, device=device).unsqueeze(0)
-            
+
             # pred_traj的输出是归一化的，所以在计算loss时直接用pred_traj和true_traj（都是归一化的）进行比较是合理的
-            pred_traj = model(z0, t, scene_scale=scene_scale)  # [batch, time, obj, 17]
+            if is_slotformer:
+                # 真实前 H 帧作为 burn-in
+                state_seq = torch.cat([body_prop, vel, ang_vel], dim=-1)  # [B, 150, N, 17]
+                history = state_seq[:, :args.history_len]  # [B, H, N, 17]
+                pred_traj = model(z0, t, scene_scale=scene_scale, history=history)  # [batch, time, obj, 17]
+            else:
+                pred_traj = model(z0, t, scene_scale=scene_scale)  # [batch, time, obj, 17]
             pred_pos = pred_traj[..., 0:3]
             pred_quat = pred_traj[..., 3:7]
             
@@ -419,7 +431,8 @@ def main():
     print(f"Loaded model module: {model_module.__name__}")    
 
     module_short_name = model_module.__name__.split(".")[-1]
-    if "slotformer" in module_short_name:
+    is_slotformer = "slotformer" in module_short_name
+    if is_slotformer:
         # Transformer-based dynamics model (no ODE integration -> no divergence NaN)
         model = model_module.DynamicsSlotFormer(
             slot_size=17,
@@ -522,6 +535,19 @@ def main():
         default_segment_len=args.segment_len,
     )
 
+    # 前置校验: SlotFormer 需要每个 segment_len > history_len (burn-in 后至少剩 1 帧可预测)。
+    # 在训练开始前就报错, 避免跑到对应 epoch 才中断。
+    if is_slotformer:
+        min_seg_len = min(seg_len for _, seg_len in curriculum_schedule)
+        if min_seg_len <= args.history_len:
+            raise ValueError(
+                f"[SlotFormer config error] history_len={args.history_len} but the smallest curriculum "
+                f"segment_len={min_seg_len}. Every segment_len must be > history_len "
+                f"(need >=1 frame to predict after burn-in). "
+                f"Lower --history_len (<= {min_seg_len - 1}) or use a custom --curriculum with larger segments. "
+                f"Current schedule: {curriculum_schedule}"
+            )
+
     for epoch in range(args.epochs):
         epoch_loss = 0
         start_time = time.time()
@@ -536,6 +562,12 @@ def main():
                 break
         if args.segment_stride > 0:
             current_segment_stride = min(current_segment_stride, current_segment_len)
+        if is_slotformer and current_segment_len <= args.history_len:
+            raise ValueError(
+                f"segment_len ({current_segment_len}) must be > history_len ({args.history_len}) "
+                f"for SlotFormer (need >=1 frame to predict after burn-in). "
+                f"Adjust --curriculum / --segment_len or lower --history_len."
+            )
         print(f"Epoch {epoch+1}: Training with Segment Length = {current_segment_len}, Stride = {current_segment_stride}")
         
         # 训练阶段
@@ -573,17 +605,23 @@ def main():
             scene_scale_expanded = scene_scale.repeat_interleave(num_segments_per_sample) # [Batch*Seg]
             
             z0 = torch.cat([
-                body_prop_s[:, 0, :, :], 
-                vel_s[:, 0, :, :],       
-                ang_vel_s[:, 0, :, :]    
+                body_prop_s[:, 0, :, :],
+                vel_s[:, 0, :, :],
+                ang_vel_s[:, 0, :, :]
             ], dim=-1)
-            
+
             sim_steps = true_traj_s.shape[1]
             t = torch.linspace(0, (sim_steps-1)/25.0, steps=sim_steps, device=device).unsqueeze(0)
-            
+
             optimizer.zero_grad()
-            
-            pred_traj = model(z0, t, scene_scale=scene_scale_expanded)
+
+            if is_slotformer:
+                # 真实前 H 帧作为 burn-in (而非复制第0帧)
+                state_seq = torch.cat([body_prop_s, vel_s, ang_vel_s], dim=-1)  # [B*Seg, T, N, 17]
+                history = state_seq[:, :args.history_len]  # [B*Seg, H, N, 17]
+                pred_traj = model(z0, t, scene_scale=scene_scale_expanded, history=history)
+            else:
+                pred_traj = model(z0, t, scene_scale=scene_scale_expanded)
             pred_pos = pred_traj[..., 0:3]
             pred_quat = pred_traj[..., 3:7]
             
@@ -688,7 +726,7 @@ def main():
         if (epoch + 1) % args.val_interval == 0 or epoch == args.epochs - 1:
             # 先运行验证计算损失
             val_loss, val_loss_pos, val_loss_quat, val_angle_mean, val_angle_p90, val_angle_max = validate_epoch(
-                model, val_loader, criterion, device, args, save_predictions=False
+                model, val_loader, criterion, device, args, save_predictions=False, is_slotformer=is_slotformer
             )
             
             train_history['val_loss'].append(val_loss)
@@ -727,7 +765,7 @@ def main():
                 if args.save_vis_data:
                     print(f"  --> Collecting visualization data...")
                     _, _, _, _, _, _, predictions = validate_epoch(
-                        model, val_loader, criterion, device, args, save_predictions=True
+                        model, val_loader, criterion, device, args, save_predictions=True, is_slotformer=is_slotformer
                     )
                     
                     vis_save_path = os.path.join(vis_dir, f'debug_vis_epoch{epoch+1}.npz')
